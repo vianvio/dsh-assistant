@@ -1,0 +1,54 @@
+{
+  "name": "dsh-assistant",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DSH小助手：原生 Swift 悬浮窗负责展示与交互，宿主插件负责把它接到 DSH 会话状态（含今日工作总结）",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": {
+      "default": "./src/index.js"
+    },
+    "./client": "./src/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "native/Sources",
+    "native/Info.plist",
+    "scripts",
+    "assets/pack",
+    "runtime/bin",
+    "cordis.patch.yml"
+  ],
+  "scripts": {
+    "build:pack": "python3 scripts/build_pack.py --out assets/pack --char-h 240 --quality 86",
+    "build:helper": "bash scripts/build-helper.sh",
+    "build": "bash scripts/build-helper.sh && node scripts/verify.mjs",
+    "verify": "node scripts/verify.mjs",
+    "test": "node --test --test-timeout=30000 \"test/*.test.mjs\"",
+    "test:swift": "bash scripts/test-swift.sh",
+    "probe": "node scripts/probe.mjs",
+    "report:check": "node scripts/inspect-report.mjs",
+    "test:all": "npm test && npm run test:swift && npm run verify",
+    "motion:all": "python3 scripts/convert_all_motion.py",
+    "motion:post": "python3 scripts/motion_post.py",
+    "motion:measure": "python3 scripts/measure_motion.py"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-renderer"
+      ]
+    }
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,27 @@
+# 防御性：现在仓库里没有这些，但避免以后误提交
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*credentials*
+
+# Python 缓存（脚本目录会随包分发，别把 .pyc 打进去）
+__pycache__/
+*.pyc
+
+# 动图源产物：391MB（含单个 105MB 的 mov，GitHub 硬性拒收），
+# 使用者不需要 —— 想自己生成跑 `npm run motion:all`（需要 DASHSCOPE_API_KEY）
+assets/motion/
+
+# 会话交接笔记：含作者其它项目名，不对外发布
+docs/HANDOFF.md
+
+# browser-harness 的 tab 状态（本机工具产物）
+.browser/
+
+# SwiftPM（本项目不用 swift test，见 scripts/test-swift.sh 的说明）
+.build/
+
+# 注意：runtime/bin/ 里的编译产物**要进仓库**（用户选的是"开箱即用"，
+# 别人不用装 Xcode 就能跑）。所以这里刻意不忽略它。

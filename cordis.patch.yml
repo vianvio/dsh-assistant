@@ -1,0 +1,21 @@
+# DSH小助手（dsh-assistant）组合补丁：把原生悬浮窗挂到 profile 上（零侵入）。
+#   · 宿主半边：拉起源生 helper（runtime/bin/darwin/dsh-assistant-helper.app），
+#     订阅 session/event 归约成状态，通过 stdin/stdout 的 JSON 协议喂给原生端；
+#   · 浏览器半边：只提供设置面板（大小/气泡/动效/提示音 + 互动按钮），
+#     宠物本体完全由原生端绘制，不注入任何 DOM。
+# config 为整块替换，这里写出全部默认值；整个 config 段可省略，宿主会用 schema 缺省。
+- insert:
+    - id: dsh-assistant
+      name: dsh-assistant
+      config:
+        enabled: true
+        # 尺寸档位：迷你 0.4（默认）/ 小 0.55 / 中 0.7 / 原尺寸 1.0
+        scale: 0.4
+        bubbleEnabled: true
+        # 浅色气泡配黑字，深色配白字
+        bubbleTheme: light
+        reducedMotion: false
+        soundEnabled: false
+        includeSubagents: false
+        # 任务后台总结：会话压缩时后台提炼已完成部分并留存（默认关）
+        backgroundSummary: false
