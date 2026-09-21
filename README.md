@@ -537,7 +537,3 @@ helper → 宿主：`ready` / `pong` / `interaction` / `settings` / `closed` / `
 - **素材来源**：默认取自 [dsh-whale-musume](https://github.com/Sutera-Diffusus/dsh-whale-musume)（MIT, © 2026 Sutera-Diffusus，见[参考与致谢](#参考与致谢)）。想换角色：
   把图丢进一个目录、改 `scripts/build_pack.py` 顶部的 `STATE_ASSETS` / `ACTION_ASSETS`，
   重跑 `npm run build:pack` 即可，宿主与原生端都不用改。
-
-## 待决（需要人来拍板）
-
-见 `docs/DECISIONS.md`。
