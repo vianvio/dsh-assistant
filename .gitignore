@@ -14,8 +14,9 @@ __pycache__/
 # 使用者不需要 —— 想自己生成跑 `npm run motion:all`（需要 DASHSCOPE_API_KEY）
 assets/motion/
 
-# 会话交接笔记：含作者其它项目名，不对外发布
-docs/HANDOFF.md
+# 内部文档：不对外发布（本地保留，正常用）
+docs/HANDOFF.md        # 会话交接笔记（含作者其它项目名）
+docs/DECISIONS.md      # 待决清单（作者自己的取舍记录）
 
 # browser-harness 的 tab 状态（本机工具产物）
 .browser/
