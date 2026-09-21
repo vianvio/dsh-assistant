@@ -222,19 +222,34 @@ IDLE ──TURN_STARTED──▶ THINKING ──TOOL_STARTED──▶ WORKING
 | POST | `/plugins/dsh-assistant/config/viewed` | 客户端上报"在看哪个会话" → 消通知 |
 | GET | `/plugins/dsh-assistant/config/pending` | 客户端长轮询取命令（打开会话） |
 
-## 完成通知：独立一层，钉到被查看为止
+## 通知层：完成 / 出错 / 等你确认
 
 **问题**：状态气泡表达的是「此刻在干什么」，并行时会被优先级更高的项目抢走
 （WAITING > ERROR > WORKING > THINKING > SUCCESS > IDLE）。所以"某个任务跑完了"
 一旦被抢走，桌面上就再也看不到，用户只能切回 DSH。
 
-**做法**：完成/出错时另发一条 `notice`，原生端在**状态气泡上方单开一条通知栏**
-（窗口向上长，宠物位置不动，最多同时 3 条，最新在最前）；每条自带 20 分钟兜底超时。
+**做法**：完成 / 出错 / 等你确认时另发一条 `notice`，原生端在**状态气泡上方单开一条
+通知栏**（窗口向上长，宠物位置不动，最多同时 3 条，最新在最前）；每条自带 20 分钟
+兜底超时。左侧竖条按状态配色：完成=绿，出错=红，等你确认=橙。
+
+| 通知 | 什么时候发 | 点击 |
+| --- | --- | --- |
+| 任务完成了 | 回合以 `completed` 结束（SUCCESS 脉冲） | 切到那个会话 |
+| 任务出错了 | 回合以失败/到达上限结束（ERROR 脉冲） | 切到那个会话 |
+| **等你确认** | 会话**迁移进** WAITING：问了问题（`ask_user_question`）、要审批、或回合以 `blocked` 结束 | 切到那个会话 |
+
+![等你确认与完成通知同时挂着](assets/readme/waiting-notice.png)
+
+「等你确认」为什么不靠状态气泡：那个会话**停在那儿不动**，越晚看到越亏，而气泡
+可能正被另一个在跑的项目占着 —— 和完成通知是同一个理由。它按**会话**而不是按次数发
+（id 是 `<sessionId>:wait`），所以反复问也只挂一条；离开 WAITING（用户回复、批准，
+或它自己接着跑）就自动撤掉，**只撤这一条**，同会话挂着的完成通知不受影响。
 
 | 什么时候消失 | 实现 |
 | --- | --- |
 | **点一下那条通知** | 原生端命中测试 → 本地移除并回报给宿主（见下"点通知跳到会话"） |
 | **点开日报通知** | 回报 `interaction{action:'notice-open'}`，宿主同样把账本清掉（否则会一直挂在 pendingNotices） |
+| **离开等待状态** | 宿主下发 `notice-clear{reason:'resolved'}`（只针对 `:wait` 那条） |
 | **在侧边栏切到该会话** | 客户端插件订阅会话列表的 `current` → `POST <endpoint>/viewed` → 清 |
 | **回到该项目说话** | 该会话再来 `user/message` = 已查看 → 宿主下发 `notice-clear{reason:'seen'}` |
 | **该会话首次载入内存** | `session/created` → `markSessionSeen()` → 清 |
@@ -242,7 +257,8 @@ IDLE ──TURN_STARTED──▶ THINKING ──TOOL_STARTED──▶ WORKING
 
 ### 点通知 → 跳到对应会话
 
-完成通知不只是"看一眼"：**点它会把 DSH 切到那个会话**（顺手把窗口带到前台）。
+通知不只是"看一眼"：**点它会把 DSH 切到那个会话**（顺手把窗口带到前台）——
+完成通知是这样，「等你确认」也是这样，点一下就能去把它放行。
 
 ```
 原生（点通知）──interaction{action:'notice-open-session', noticeId, sessionId}──▶ 宿主

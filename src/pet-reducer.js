@@ -50,8 +50,17 @@ const URGENT_PRIORITY = 50
  */
 const FOCUS_DWELL_MS = 3000
 
-/** 每个项目最多挂几条完成通知（钉在宠物上方直到被查看）。 */
+/** 每个项目最多挂几条通知（钉在宠物上方直到被查看）。 */
 const MAX_NOTICES = 4
+
+/**
+ * 「等你确认」通知的 id 后缀。
+ *
+ * 一个会话最多挂一条（重复进入 WAITING 会覆盖同 id），离开 WAITING 就撤。
+ * 之所以按会话而不是按次数发：用户需要知道的是"**哪个**会话在等我"，
+ * 而不是"它问了第几次" —— 后者会刷满通知层。
+ */
+const WAITING_NOTICE_SUFFIX = ':wait'
 
 export class PetReducer {
   /**
@@ -148,6 +157,39 @@ export class PetReducer {
       entry.notices.push(notice)
       if (entry.notices.length > MAX_NOTICES) entry.notices.shift()
       messages.push(createMessage(PetMessageKind.NOTICE, notice))
+    }
+
+    // 「等你确认」：也走通知层，且不看焦点。
+    //
+    // 和完成通知的区别在于**它还没结束**：那个会话卡在 WAITING 不动，
+    // 用户在别的窗口里干活时，光看状态气泡是发现不了的（气泡可能正被别的项目占着），
+    // 所以这里也要冒一条，并且点一下能跳到那个对话。
+    // 只在**真的迁移进** WAITING 时发（`from` 只在真迁移上出现）——
+    // 否则在 WAITING 里每来一条文案更新都会重发一条。
+    if (outcome.changed && outcome.from !== undefined && outcome.from !== PetState.WAITING
+      && outcome.state === PetState.WAITING) {
+      const copy = noticeCopy(PetState.WAITING, {
+        project: entry.project,
+        detail: entry.machine.stage ?? undefined,
+      })
+      const notice = {
+        id: `${entry.machine.id}${WAITING_NOTICE_SUFFIX}`,
+        sessionId: entry.machine.id,
+        project: entry.project ?? '会话',
+        state: PetState.WAITING,
+        title: copy.title,
+        detail: copy.detail,
+        createdAt: Date.now(),
+      }
+      entry.notices.push(notice)
+      if (entry.notices.length > MAX_NOTICES) entry.notices.shift()
+      messages.push(createMessage(PetMessageKind.NOTICE, notice))
+    }
+
+    // 离开 WAITING = 用户回复/批准了，或者它自己接着跑了 → 这条催办没意义了。
+    // 只撤 `:wait` 那条，同会话可能同时挂着完成通知，别误伤。
+    if (outcome.changed && outcome.from === PetState.WAITING && outcome.state !== PetState.WAITING) {
+      messages.push(...this.#clearWaitingNotice(entry, 'resolved'))
     }
 
     // 用户又在这个项目里说话了 → 说明他看过这个项目了，清掉它的通知
@@ -266,6 +308,21 @@ export class PetReducer {
     const messages = entry.notices.map((notice) =>
       createMessage(PetMessageKind.NOTICE_CLEAR, { id: notice.id, reason }))
     entry.notices.length = 0
+    return messages
+  }
+
+  /** 只撤「等你确认」那条（`:wait`），同会话挂着的完成通知不动。 */
+  #clearWaitingNotice(entry, reason) {
+    const messages = []
+    const keep = []
+    for (const notice of entry.notices) {
+      if (notice.id.endsWith(WAITING_NOTICE_SUFFIX)) {
+        messages.push(createMessage(PetMessageKind.NOTICE_CLEAR, { id: notice.id, reason }))
+      } else {
+        keep.push(notice)
+      }
+    }
+    entry.notices = keep
     return messages
   }
 

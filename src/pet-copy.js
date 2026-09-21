@@ -170,15 +170,20 @@ export function singleDetail({ project, stage, progress, task, maxTask = 12 } = 
 }
 
 /**
- * 完成通知的文案。
+ * 通知层的文案（完成 / 出错 / 等你确认）。
  *
  * 为什么单独一套：状态气泡表达的是「此刻在干什么」，会被并行里优先级更高的项目
  * 抢走（WAITING > ERROR > WORKING > …）。任务跑完的消息不能只靠状态气泡 ——
  * 一旦有别的项目在跑，完成信息就没了，用户只能切回 DSH 才看得到。
  * 所以通知是**独立一层**，钉在宠物上方，直到被查看。
+ *
+ * 「等你确认」同理，而且更急：那个会话**停在那儿不动**，越晚看到越亏，
+ * 所以它也走通知层 —— 点一下就跳到那个对话。
  */
 export function noticeCopy(state, { project, detail } = {}) {
-  const title = state === 'ERROR' ? '任务出错了' : '任务完成了'
+  const title = state === 'ERROR' ? '任务出错了'
+    : state === 'WAITING' ? '等你确认'
+      : '任务完成了'
   const tail = detail ? ` · ${detail}` : ''
   return { title, detail: `${project ?? '会话'}${tail}` }
 }

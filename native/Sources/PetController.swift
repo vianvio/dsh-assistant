@@ -765,8 +765,14 @@ final class PetController: NSObject {
             path.lineWidth = 1
             path.stroke()
 
-            // 状态色竖条：完成=绿，出错=红
-            let accent = notice.state == .error ? NSColor.systemRed : NSColor.systemGreen
+            // 状态色竖条：完成=绿，出错=红，等你确认=橙
+            // （等你确认还没结束，比"完成"更需要人搭手，用最跳的颜色）
+            let accent: NSColor
+            switch notice.state {
+            case .error: accent = .systemRed
+            case .waiting: accent = .systemOrange
+            default: accent = .systemGreen
+            }
             accent.setFill()
             let bar = NSRect(x: rect.minX + 2, y: rect.minY + 3, width: max(3, 3.5 * metrics.bubbleScale),
                              height: rect.height - 6)

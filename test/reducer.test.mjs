@@ -409,3 +409,65 @@ test('完成通知：每个项目最多挂 MAX 条，不会无限长', () => {
   }
   assert.ok(reducer.pendingNotices().length <= 4, `实际 ${reducer.pendingNotices().length}`)
 })
+
+test('等待通知：会话卡在等你确认时也冒一条（气泡被别的项目占着也看得到）', () => {
+  const reducer = new PetReducer()
+  const sessionA = { id: 'session-a', cwd: '/tmp/project-a', title: '项目A' }
+  const sessionB = { id: 'session-b', cwd: '/tmp/project-b', title: '项目B' }
+
+  reducer.handle(sessionA, { type: 'turn/start', seq: 1 })
+  // B 在跑 → 主角是 B，A 的状态进不了气泡；这正是不发通知就看不见的场景
+  reducer.handle(sessionB, { type: 'turn/start', seq: 1 })
+  reducer.handle(sessionB, { type: 'step/start', seq: 2 })
+
+  const messages = reducer.handle(sessionA, {
+    type: 'tool/call', seq: 2, data: { name: 'ask_user_question', callId: 'q1' },
+  })
+  const notices = messages.filter((message) => message.kind === 'notice')
+  assert.equal(notices.length, 1, '等确认要发通知，而不是只改状态气泡')
+  assert.equal(notices[0].state, PetState.WAITING)
+  assert.equal(notices[0].sessionId, 'session-a', '点击时要据此打开对应对话')
+  assert.match(notices[0].title, /等你确认/)
+  assert.match(notices[0].detail, /project-a/, '第二行要带项目名')
+  assert.match(notices[0].detail, /等待确认/, '第二行还要说清在等什么')
+  assert.ok(notices[0].id.endsWith(':wait'), 'id 带 :wait 后缀，便于只撤这一条')
+
+  // 在 WAITING 里再来一条文案更新（APPROVAL_REQUESTED 之类不会迁移状态）→ 不重复发
+  const again = reducer.handle(sessionA, { type: 'assistant/chunk', seq: 3, data: { text: '…' } })
+  assert.equal(again.filter((message) => message.kind === 'notice').length, 0, '停在等待里不该反复刷通知')
+  assert.equal(reducer.pendingNotices().filter((n) => n.id.endsWith(':wait')).length, 1)
+})
+
+test('等待通知：离开等待就撤，且不误伤同会话的完成通知', () => {
+  const reducer = new PetReducer()
+  const a = session('a')
+
+  // 先跑完一轮 → 挂一条完成通知（用户还没看）
+  reducer.handle(a, { type: 'turn/start', seq: 1 })
+  reducer.handle(a, { type: 'tool/call', seq: 2, data: { name: 'bash', callId: 'c1' } })
+  reducer.handle(a, { type: 'turn/end', seq: 3, data: { reason: { kind: 'completed' } } })
+  assert.equal(reducer.pendingNotices().length, 1)
+
+  // 新一轮里卡在等确认 → 两条并存
+  reducer.handle(a, { type: 'turn/start', seq: 4 })
+  reducer.handle(a, { type: 'tool/call', seq: 5, data: { name: 'ask_user_question', callId: 'q1' } })
+  assert.equal(reducer.pendingNotices().length, 2, '完成通知与等待通知各挂一条')
+
+  // 用户批准/继续 → 只撤 :wait
+  const resolved = reducer.handle(a, { type: 'tool/call', seq: 6, data: { name: 'bash', callId: 'c2' } })
+  const clears = resolved.filter((message) => message.kind === 'notice-clear')
+  assert.equal(clears.length, 1, '离开等待只撤一条')
+  assert.ok(clears[0].id.endsWith(':wait'), '撤的是等待那条')
+  assert.equal(clears[0].reason, 'resolved')
+  const left = reducer.pendingNotices()
+  assert.equal(left.length, 1, '完成通知还在')
+  assert.ok(!left[0].id.endsWith(':wait'))
+
+  // 用户回复也算离开等待（同时清掉整个项目的通知 = 已查看）
+  reducer.handle(a, { type: 'turn/start', seq: 7 })
+  reducer.handle(a, { type: 'turn/end', seq: 8, data: { reason: { kind: 'blocked' } } })
+  assert.equal(reducer.pendingNotices().filter((n) => n.id.endsWith(':wait')).length, 1, '阻塞结束也算等确认')
+  const replied = reducer.handle(a, { type: 'user/message', seq: 9 })
+  assert.ok(replied.some((message) => message.kind === 'notice-clear'), '回复后等待通知撤掉')
+  assert.equal(reducer.pendingNotices().length, 0)
+})
