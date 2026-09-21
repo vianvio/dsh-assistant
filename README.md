@@ -152,7 +152,8 @@ IDLE ──TURN_STARTED──▶ THINKING ──TOOL_STARTED──▶ WORKING
 ```
 
 `SUCCESS` / `ERROR` 是「停留态」：宿主每秒 tick 一次状态机，到点自动回落，不依赖下一条事件。
-`DISCONNECTED` 目前没有触发点（见文末「待决」）。
+`DISCONNECTED` 目前没有触发点：素材表里有 9 段"睡着/钓鱼/发呆"的动画，但代码里没有
+把它置位的路径 —— 留给以后接"helper 掉线"这类语义时用。
 
 ## 多项目并行：两行短句说清全局
 
