@@ -3,6 +3,23 @@
   "version": "0.1.0",
   "private": true,
   "description": "DSH小助手：原生 Swift 悬浮窗负责展示与交互，宿主插件负责把它接到 DSH 会话状态（含今日工作总结）",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "dsh-plugin",
+    "cordis",
+    "desktop-pet",
+    "appkit",
+    "macos"
+  ],
+  "homepage": "https://github.com/vianvio/dsh-assistant#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vianvio/dsh-assistant.git"
+  },
+  "bugs": {
+    "url": "https://github.com/vianvio/dsh-assistant/issues"
+  },
   "type": "module",
   "main": "src/index.js",
   "exports": {
