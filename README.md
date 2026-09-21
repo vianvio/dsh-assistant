@@ -1,14 +1,55 @@
-# dsh-assistant（DSH小助手）
+<div align="center">
 
-DSH小助手。**展示与交互逻辑跑在原生 Swift 里，状态由 DSH 会话事件驱动**，
-两者之间只有一条一行一条 JSON 的 stdio 协议 —— 没有 WebView、没有注入 DOM、
-没有在你的页面里画画。
+# DSH小助手 🐋
 
-> **改过名**：原先叫 `dsh-pet`（中文名「DS看板娘」）。改名只换了**对外标识**
-> （包名、插件 id、设置 namespace、数据目录、env 前缀、helper 应用名、日报会话前缀），
-> **没有**改内部的代码标识 —— `src/pet-*.js`、`PetView.swift`、`mountPet()` 这些名字
-> 里的 `pet` 指的是"这只角色"，不是项目名。日报会话前缀认**两种**
-> （`pet-review-*` 是旧会话，`assistant-review-*` 是新的），因为它们还躺在会话存储里。
+**住在桌面上、由 DeepSeek Harness 真实工作状态驱动的 Agent 伴侣。**
+
+入口属于 DSH，生命周期属于 DSH，显示层属于桌面。
+
+[使用](#使用) · [外观设置](#外观设置) · [素材与动画](#素材与动画) · [协议](#协议v1) · [参考与致谢](#参考与致谢) · [已知边界](#已知边界)
+
+![version](https://img.shields.io/badge/version-0.1.0-informational) · [![license](https://img.shields.io/badge/license-MIT-success)](LICENSE) · ![platform](https://img.shields.io/badge/platform-macOS%2013%2B-lightgrey) · ![DSH](https://img.shields.io/badge/DSH-plugin-4B6BFB)
+
+</div>
+
+![DSH小助手在真实任务中显示多项目状态](assets/readme/hero.png)
+
+DSH小助手不是需要单独启动的桌宠应用：它由 DSH 插件拉起，跟着 DSH 一起启动和退出，
+以透明、无边框、始终置顶的原生窗口待在桌面上。切到 VS Code、浏览器或全屏应用之后，
+照样能看到 DSH 当前在思考、在执行、在等你确认，还是已经完成。
+
+> 当前版本 `0.1.0` · macOS（Apple Silicon / Intel 通用二进制）· 仓库自带编译好的 helper
+> 与素材包，clone 下来就能跑，不需要 Xcode
+
+## 状态展示
+
+七个耐久状态各自有动作与文案，同一状态还会随机换姿势，不会一直重复同一张图。
+
+| 待机 | 思考 |
+| --- | --- |
+| ![待机中](assets/readme/status-idle.png) | ![正在思考](assets/readme/status-thinking.png) |
+
+| 执行 | 等你确认 |
+| --- | --- |
+| ![正在执行](assets/readme/status-working.png) | ![等你确认](assets/readme/status-waiting.png) |
+
+| 完成 | 出错 |
+| --- | --- |
+| ![任务完成](assets/readme/status-success.png) | ![任务出错](assets/readme/status-error.png) |
+
+多项目并行时，气泡只给两行关键信息：谁在跑、谁在等你。
+
+![多项目并行](assets/readme/parallel.png)
+
+完成通知是**独立的一层**：状态气泡被"还在跑的项目"占着，通知照样出得来，
+而且会一直挂着，点一下才消失。
+
+![完成通知](assets/readme/notice.png)
+
+## 它是什么
+
+**展示与交互逻辑跑在原生 Swift 里，状态由 DSH 会话事件驱动**，两者之间只有一条
+一行一条 JSON 的 stdio 协议 —— 没有 WebView、没有注入 DOM、没有在你的页面里画画。
 
 ```
 DSH worker（Node）                        原生 helper（Swift / AppKit）
@@ -73,7 +114,9 @@ test/                       Node 单测（按模块分文件）
 scripts/                    素材管线与构建脚本（见下）
 assets/pack/                素材包（脚本生成，可换成自己的立绘）
 assets/motion/              序列帧源（含 source.mp4 归档，不进版本库）
-runtime/bin/darwin/         编译产物 .app（不进版本库）
+assets/readme/              README 里的状态样例图（原生窗口原样截取，带透明通道）
+runtime/bin/darwin/         编译产物 .app（**仓库里直接带了**，clone 即可用；
+                            重新编译见 `npm run build:helper`）
 ```
 
 ## 使用
@@ -310,6 +353,8 @@ bubbleScale = min(1, scale × 1.5)      # 小尺寸放大 1.5×，≥70% 时封�
 产出一份「今天做了什么 + 待办」的 markdown，生成完在宠物上方弹一条通知，
 **点一下打开弹窗**，弹窗里有「复制 Markdown」按钮（复制的是**原文**，不是渲染结果）。
 
+![今日总结弹窗](assets/readme/today-report.png)
+
 ### 新会话必须是隐藏的
 
 DSH 没有 `hidden` 开关，**真正的隐藏标记是 `origin: 'subagent'`** ——
@@ -526,6 +571,20 @@ helper → 宿主：`ready` / `pong` / `interaction` / `settings` / `closed` / `
 - 配色与排版参考了 DSH 自身的界面规范（深/浅两套气泡配色）。
 
 完整署名与许可见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
+
+## 改名说明（`dsh-pet` → `dsh-assistant`）
+
+原先叫 `dsh-pet`（中文名「DS看板娘」）。改名只换了**对外标识** —— 包名、插件 id、
+设置 namespace、数据目录、env 前缀、helper 应用名、日报会话前缀 —— **没有**改内部的
+代码标识：`src/pet-*.js`、`PetView.swift`、`mountPet()` 这些名字里的 `pet` 指的是
+"这只角色"，不是项目名。
+
+升级时有两处兼容是有意保留的：
+
+- 日报会话前缀认**两种**：`pet-review-*`（旧会话）与 `assistant-review-*`（新会话），
+  因为它们都已经躺在会话存储里了；
+- 设置段与数据目录会从 `dsh-pet` **复制**到 `dsh-assistant`，旧目录原样保留
+  （确认无误后可以自己删掉 `$DSH_HOME/dsh-pet/`）。
 
 ## 已知边界
 
