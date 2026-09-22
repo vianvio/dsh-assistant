@@ -54,23 +54,33 @@ DSH小助手不是需要单独启动的桌宠应用：它由 DSH 插件拉起，
 ### 装到 DSH 里
 
 ```bash
-git clone https://github.com/vianvio/dsh-assistant.git ~/dsh-assistant
+dsh plugin --profile desktop add github:vianvio/dsh-assistant
 ```
 
-然后在 profile 的 `package.json` 里加依赖与 bundle id（与其它本地插件一样走 link）：
-
-```json
-{
-  "dependencies": { "dsh-assistant": "link:~/dsh-assistant" },
-  "dsh": { "profile": { "bundles": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "dsh-assistant"] } }
-}
-```
+`--profile` 填你实际在用的那个（桌面端是 `desktop`，Web 端是 `web`）。
+这条命令背后是 pnpm：装完包之后，它会**自动**把声明了 `dsh.bundle` 的依赖加进
+profile 的 `dsh.profile.bundles` —— 不用手改 `package.json`。
 
 重启 DSH 后，桌面右下角会出现宠物，设置面板里多一张「DSH小助手」卡片。
 
+以后升级：
+
+```bash
+dsh plugin --profile desktop update dsh-assistant
+```
+
+### 改这个插件本身
+
+改用 link，改完不用重装：
+
+```bash
+git clone https://github.com/vianvio/dsh-assistant.git ~/dsh-assistant
+dsh plugin --profile desktop add link:$HOME/dsh-assistant
+```
+
 ### 自己构建（可选）
 
-仓库里已经带了编译好的 macOS helper 与素材包，**平时用不到这些命令**；
+仓库里带了编译好的 macOS helper 与素材包，上面两种装法**都用不到这些命令**；
 只有改了原生端或想换素材时才需要：
 
 ```bash
