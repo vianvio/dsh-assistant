@@ -480,33 +480,6 @@ npm run motion:measure  # 诊断：每段的动作幅度（step/range），指�
 `build_pack.py` 的两条安全约定：**先读源图再动输出目录**（源目录指错时不会把
 `assets/pack` 清空），`--dry-run` 只报计划；manifest 原子写。
 
-### 用百炼把静图变成微动作序列帧
-
-`scripts/bailian_motion.py` 走完整链路：
-静图 → 合成绿幕 → 首尾帧生视频 → ffmpeg 抽帧 → 色键抠像 + 原图 alpha 约束 →
-整段同一缩放系数、底边对齐 → `assets/motion/<group>/<clip>/` + sidecar。
-
-几个必须知道的约束：
-
-| 事实 | 影响 |
-| --- | --- |
-| 万相图生视频**只接受 RGB 输入，不吃透明通道** | 必须先把角色合成到纯色幕布上 |
-| 输出永远是 MP4（H.264），**没有 alpha** | 抽帧后要自己抠像 |
-| 首帧与尾帧可以是**同一张图** | 模型只在中间插微动、回到原位 → 天然无缝循环 |
-| 模型 / Endpoint / API Key 必须同一地域 | 北京用 `dashscope.aliyuncs.com`，跨境调用直接失败 |
-| 结果视频 URL 只保留 24 小时 | 脚本里下完就落地成 `source.mp4` 归档 |
-
-归档的 `generation.json` **只增不改**：`--from-archive` 重新抽帧不会把当初生成它那次的
-`task_id` 抹掉（曾经每跑一次就清空一遍，88 段的 provenance 全是 null）。
-
-```bash
-export DASHSCOPE_API_KEY=sk-xxxx
-python3 scripts/bailian_motion.py --pose idle-cute --group idle --clip idle-cute-motion \
-    --state IDLE --dry-run                       # 先看会发出什么请求（不花钱）
-npm run motion:all -- --dry-run --limit 1        # 批量；--reprocess-archive 零成本重做后处理
-npm run build:pack && npm run verify             # 合并并检查契约
-```
-
 ## 协议（v1）
 
 宿主 → helper：`hello` / `config` / `state` / `pulse` / `overlay` / `notice` /
