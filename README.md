@@ -586,20 +586,6 @@ helper → 宿主：`ready` / `pong` / `interaction` / `settings` / `closed` / `
 
 完整署名与许可见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
 
-## 改名说明（`dsh-pet` → `dsh-assistant`）
-
-原先叫 `dsh-pet`（中文名「DS看板娘」）。改名只换了**对外标识** —— 包名、插件 id、
-设置 namespace、数据目录、env 前缀、helper 应用名、日报会话前缀 —— **没有**改内部的
-代码标识：`src/pet-*.js`、`PetView.swift`、`mountPet()` 这些名字里的 `pet` 指的是
-"这只角色"，不是项目名。
-
-升级时有两处兼容是有意保留的：
-
-- 日报会话前缀认**两种**：`pet-review-*`（旧会话）与 `assistant-review-*`（新会话），
-  因为它们都已经躺在会话存储里了；
-- 设置段与数据目录会从 `dsh-pet` **复制**到 `dsh-assistant`，旧目录原样保留
-  （确认无误后可以自己删掉 `$DSH_HOME/dsh-pet/`）。
-
 ## 已知边界
 
 - **平台**：原生 helper 目前只有 macOS（AppKit）。Windows/Linux 要么重写面板层，
