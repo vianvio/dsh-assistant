@@ -458,8 +458,17 @@ export function configMessage(resolved, settings) {
   return message
 }
 
-/** 原生端自己也存了一份的字段（它们不该被宿主默认值覆盖）。 */
-const OVERRIDABLE_FIELDS = Object.freeze(['scale', 'bubbleEnabled', 'bubbleTheme', 'reducedMotion', 'soundEnabled'])
+/**
+ * 原生端自己也存了一份的字段（它们不该被宿主默认值覆盖）。
+ *
+ * 后两个（自动互动）原生端其实没有本地副本 —— 它的内置默认值与 schema 默认值相同，
+ * 所以不设也一致。放进来只是为了让"只下发用户显式设过的字段"这条规则保持一致，
+ * 不为它们开特例。
+ */
+const OVERRIDABLE_FIELDS = Object.freeze([
+  'scale', 'bubbleEnabled', 'bubbleTheme', 'reducedMotion', 'soundEnabled',
+  'autoInteract', 'autoInteractSeconds',
+])
 
 function errorText(error) {
   return error instanceof Error ? error.message : String(error)

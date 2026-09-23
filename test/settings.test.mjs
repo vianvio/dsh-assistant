@@ -13,6 +13,7 @@ import {
   BUBBLE_THEMES,
   PetConfig,
   WRITABLE_FIELDS,
+  clampAutoInteractSeconds,
   clampScale,
   createMemoryScope,
   createSettingsScope,
@@ -35,6 +36,24 @@ test('设置：归一化会丢弃未知字段、夹住范围、校验配色', ()
   assert.equal(clampScale(Number.NaN), defaults.scale)
   assert.equal(defaults.scale, 0.4, '默认按 40% 出镜')
   assert.deepEqual(BUBBLE_THEMES, ['light', 'dark'])
+})
+
+test('设置：自动互动（开关 + 间隔秒数）归一化与夹取', () => {
+  const on = publicConfig({})
+  assert.equal(on.autoInteract, true, '默认开：这是它的性格')
+  assert.equal(on.autoInteractSeconds, 10, '默认每 10 秒掷一次')
+
+  assert.equal(publicConfig({ autoInteract: false }).autoInteract, false, '关得掉')
+  assert.equal(publicConfig({ autoInteract: 'no' }).autoInteract, true, '只有显式 false 才算关')
+
+  assert.equal(clampAutoInteractSeconds(1), 5, '太密 → 提到 5 秒')
+  assert.equal(clampAutoInteractSeconds(9999), 300, '太疏 → 压到 5 分钟')
+  assert.equal(clampAutoInteractSeconds(37.6), 38, '取整')
+  assert.equal(clampAutoInteractSeconds(Number.NaN), 10, '非法值落回默认')
+  assert.equal(publicConfig({ autoInteractSeconds: 0 }).autoInteractSeconds, 5)
+
+  assert.ok(WRITABLE_FIELDS.includes('autoInteract'), '设置卡要能改')
+  assert.ok(WRITABLE_FIELDS.includes('autoInteractSeconds'))
 })
 
 test('设置：组合配置只认白名单字段，schema 描述齐全', () => {
@@ -172,6 +191,20 @@ test('配置下发：用户改过的字段（含原生菜单回写）会带下�
   assert.equal(message.scale, 1.2)
   assert.equal(message.bubbleTheme, 'dark')
   assert.equal(message.bubbleEnabled, undefined, '没改过的字段仍然不下发')
+})
+
+test('配置下发：自动互动的开关与间隔会送到原生端（关掉时送 false）', async () => {
+  const untouched = createMemoryScope(defaults)
+  const plain = configMessage(untouched.get(), untouched)
+  assert.equal(plain.autoInteract, undefined, '没设过就不下发 —— 原生端内置默认值与之相同')
+  assert.equal(plain.autoInteractSeconds, undefined)
+
+  const scope = createMemoryScope(defaults)
+  await scope.update({ autoInteract: false, autoInteractSeconds: 45 })
+  const message = configMessage(scope.get(), scope)
+  assert.equal(message.autoInteract, false, '关掉要明确送到，不能靠"没发"来表达')
+  assert.equal(message.autoInteractSeconds, 45)
+  assert.equal(message.kind, PetMessageKind.CONFIG)
 })
 
 /* ---------------------------------------------------------- 本地端点 */

@@ -29,6 +29,8 @@ export const WRITABLE_FIELDS = Object.freeze([
   'soundEnabled',
   'includeSubagents',
   'backgroundSummary',
+  'autoInteract',
+  'autoInteractSeconds',
 ])
 
 /** 气泡配色：浅色配黑字，深色配白字。 */
@@ -45,6 +47,9 @@ export const defaults = Object.freeze({
   includeSubagents: false,
   /** 任务后台总结：默认关（关了就是"全量重读"那条实现） */
   backgroundSummary: false,
+  /** 自己找点事做：状态停留够久就随机来一次互动 */
+  autoInteract: true,
+  autoInteractSeconds: 10,
 })
 
 /**
@@ -93,6 +98,12 @@ export const PetConfig = Schema?.object({
   backgroundSummary: Schema.boolean()
     .default(false)
     .description('任务后台总结：会话每次压缩时后台提炼已完成的部分并留存，"今日总结"只补最后没压缩的增量再合并（不开启则每次全量重读）'),
+  autoInteract: Schema.boolean()
+    .default(true)
+    .description('自己找点事做：任意状态停留够久就随机来一次投喂点心 / 夸夸它 / 摸摸头（浮层播放期间不打扰）'),
+  autoInteractSeconds: Schema.number()
+    .min(5).max(300).step(5).default(10).role('slider')
+    .description('自动互动的判定间隔（秒）：每隔这么久掷一次 30% 的骰子，中了就随机挑一个动作'),
 }).description('由 DSH 会话状态驱动的桌面宠物')
 
 /** 归一化：丢掉未知字段、夹住数值范围、布尔只认 true。 */
@@ -106,12 +117,20 @@ export function publicConfig(config = {}) {
     soundEnabled: config.soundEnabled === true,
     includeSubagents: config.includeSubagents === true,
     backgroundSummary: config.backgroundSummary === true,
+    autoInteract: config.autoInteract !== false,
+    autoInteractSeconds: clampAutoInteractSeconds(Number(config.autoInteractSeconds ?? defaults.autoInteractSeconds)),
   }
 }
 
 export function clampScale(value) {
   if (!Number.isFinite(value)) return defaults.scale
   return Math.min(2, Math.max(0.15, Math.round(value * 100) / 100))
+}
+
+/** 间隔夹在 5–300 秒；太小的值等于让宠物一直自己动，太大的值等于关掉。 */
+export function clampAutoInteractSeconds(value) {
+  if (!Number.isFinite(value)) return defaults.autoInteractSeconds
+  return Math.min(300, Math.max(5, Math.round(value)))
 }
 
 /** 只保留白名单字段的补丁。 */

@@ -233,6 +233,34 @@ window.__ModuleLoader__.load({
         ),
 
         React.createElement('li', null,
+          React.createElement(Field, {
+            label: '自己找点事做',
+            hint: '任意状态停留够久就自己掷一次骰子，随机来一次投喂点心 / 夸夸它 / 摸摸头',
+          },
+            React.createElement(Toggle, {
+              checked: value.autoInteract !== false,
+              disabled: !writable,
+              onChange: (next) => void write('autoInteract', next),
+            }),
+          ),
+        ),
+
+        React.createElement('li', null,
+          React.createElement(Field, {
+            label: `自动互动间隔 ${value.autoInteractSeconds ?? 10} 秒`,
+            hint: '每隔这么久掷一次 30% 的骰子；调大更安静（范围 5 – 300 秒）',
+          },
+            React.createElement('input', {
+              type: 'range', min: 5, max: 300, step: 5,
+              value: value.autoInteractSeconds ?? 10,
+              disabled: !writable || value.autoInteract === false,
+              style: { width: 160 },
+              onChange: (event) => writeDebounced('autoInteractSeconds', Number(event.target.value)),
+            }),
+          ),
+        ),
+
+        React.createElement('li', null,
           React.createElement(Field, { label: '提示音' },
             React.createElement(Toggle, {
               checked: value.soundEnabled === true,

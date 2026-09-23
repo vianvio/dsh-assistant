@@ -27,6 +27,9 @@ final class PetController: NSObject {
     private var bubbleEnabled: Bool
     private var reducedMotion: Bool
     private var soundEnabled: Bool
+    /// 自动互动：自己找点事做（间隔秒数；开关关掉即等价于 0）
+    private var autoInteract = true
+    private var autoInteractSeconds = 10
     private let canvasSize: NSSize
 
     /// 当前几何参数（scale / 气泡开关 / 配色 / 通知条数 → 一份不可变快照）
@@ -88,6 +91,8 @@ final class PetController: NSObject {
         super.init()
         view.controller = self
         animation.applyState(.idle, message: nil, detail: nil)
+        // 先用内置默认值（10 秒 / 开）喂内核；宿主随后发来的 config 会覆盖它
+        applyAutoInteract()
     }
 
     // MARK: - 生命周期
@@ -387,8 +392,20 @@ final class PetController: NSObject {
         if let raw = PetProtocol.stringValue(message["bubbleTheme"]), let theme = BubbleTheme(rawValue: raw) {
             bubbleTheme = theme
         }
+        // 自动互动：开关关掉就等价于间隔 0（内核里 <=0 即彻底关闭）
+        if let value = message["autoInteract"] as? Bool { autoInteract = value }
+        if let value = PetProtocol.doubleValue(message["autoInteractSeconds"]) {
+            autoInteractSeconds = min(300, max(5, Int(value.rounded())))
+        }
+        applyAutoInteract()
         resizeWindow()
         persistLayout()
+    }
+
+    /// 把两个设置换算成内核的判定间隔。宿主只发用户设过的字段，
+    /// 没设过就保持原生端的内置默认（10 秒 / 开），与 schema 默认值一致。
+    private func applyAutoInteract() {
+        animation.autoInteractMs = autoInteract ? autoInteractSeconds * 1000 : 0
     }
 
     /// 「今天干了什么」总结：正文留在本地，点通知/菜单即可打开弹窗。
@@ -475,6 +492,10 @@ final class PetController: NSObject {
             "bubbleDetailFont": Double(metrics.detailFont.pointSize),
             "noticeRowHeight": Double(metrics.noticeRowHeight),
             "noticeCount": animation.notices.count,
+            // 自动互动的**实际生效值**（排查"设置改了没反应"用）：0 = 已关闭
+            "autoInteractMs": animation.autoInteractMs,
+            "autoInteractChance": animation.autoInteractChance,
+            "dwellMs": animation.dwellMs,
             "windowWidth": Double(size.width),
             "windowHeight": Double(size.height),
             "screenCount": NSScreen.screens.count,
