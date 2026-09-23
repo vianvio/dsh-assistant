@@ -424,6 +424,81 @@ do {
     check(squeezed.height >= 24, "空间不够时最多压到 24pt，不会变成一条缝", detail: "\(squeezed.height)")
 }
 
+// 9) 自动互动：任意状态维持满一个周期，就掷一次骰子
+do {
+    func pet(_ values: [Double], state: PetState = .idle) -> PetAnimation {
+        let made = PetAnimation(manifest: manifest, random: SequenceRandom(values).next)
+        made.applyState(state, message: "待机", detail: "demo")
+        return made
+    }
+    /// 推进 n 个周期，返回取到的动作（骰子按 values 的固定序列走）
+    func roll(_ values: [Double], periods: Int = 1, state: PetState = .idle) -> String? {
+        let made = pet(values, state: state)
+        for _ in 0..<periods { _ = made.advance(elapsedMs: 10_000) }
+        return made.takeAutoInteraction()
+    }
+
+    check(roll([0.0, 0.0], periods: 0) == nil, "没推进时间就不该有自动互动")
+
+    let early = pet([0.0, 0.0])
+    _ = early.advance(elapsedMs: 9_999)
+    check(early.takeAutoInteraction() == nil, "停留不满 10 秒不掷骰子", detail: "dwell=\(early.dwellMs)")
+
+    check(roll([0.29, 0.0]) == "feed", "满 10 秒且骰子命中（0.29 < 0.3）→ 触发投喂")
+    check(roll([0.29, 0.5]) == "praise", "同一个骰子也能抽到夸夸它")
+    check(roll([0.29, 0.99]) == "pat", "也能抽到摸摸头")
+    check(roll([0.3, 0.0]) == nil, "刚好 0.3 不算命中（阈值是严格小于）")
+    check(roll([0.9], periods: 3) == nil, "连续三个周期都没中就是安静待着")
+
+    check(roll([0.0, 0.0], state: .thinking) != nil, "THINKING 也适用（任意状态）")
+    check(roll([0.0, 0.0], state: .working) != nil, "WORKING 也适用")
+    check(roll([0.0, 0.0], state: .error) != nil, "ERROR 也适用")
+
+    // 换状态 → 停留时间从头算
+    let reset = PetAnimation(manifest: manifest, random: SequenceRandom([0.0, 0.0]).next)
+    reset.applyState(.idle, message: nil, detail: nil)
+    _ = reset.advance(elapsedMs: 9_000)
+    reset.applyState(.working, message: "干活", detail: nil)
+    check(reset.dwellMs == 0, "换状态后停留时间归零", detail: "\(reset.dwellMs)")
+    _ = reset.advance(elapsedMs: 2_000)
+    check(reset.takeAutoInteraction() == nil, "换状态后才过 2 秒，还不到触发点")
+    _ = reset.advance(elapsedMs: 8_000)
+    check(reset.takeAutoInteraction() != nil, "新状态也维持满 10 秒 → 照样能触发")
+
+    // 宿主每条事件都会重发同一个状态：值没变要继续攒，不能被打断
+    let republish = PetAnimation(manifest: manifest, random: SequenceRandom([0.0, 0.0]).next)
+    republish.applyState(.working, message: "在跑", detail: "a")
+    for _ in 0..<9 {
+        _ = republish.advance(elapsedMs: 1_000)
+        republish.applyState(.working, message: "在跑", detail: "a")   // 重复下发同一状态
+    }
+    check(!republish.dwellMs.isMultiple(of: 10_000) && republish.dwellMs == 9_000,
+          "重复下发同一状态不打断计时（量的是状态维持了多久）", detail: "dwell=\(republish.dwellMs)")
+    check(republish.takeAutoInteraction() == nil, "9 秒时还没到触发点")
+    _ = republish.advance(elapsedMs: 1_000)
+    check(republish.takeAutoInteraction() != nil, "第 10 秒到点后照常掷骰子")
+
+    // 没取走之前不攒第二条（定时器被降频后补算也不会连播）
+    let burst = pet([0.0, 0.0])
+    for _ in 0..<6 { _ = burst.advance(elapsedMs: 10_000) }
+    check(burst.takeAutoInteraction() != nil, "60 秒里必中一次")
+    check(burst.takeAutoInteraction() == nil, "没取走之前不会攒出第二条")
+
+    // 浮层还在播的时候不打扰
+    let busy = pet([0.0, 0.0])
+    busy.applyOverlay(action: "pat", message: "摸摸头", ttlMs: 30_000)
+    for _ in 0..<2 { _ = busy.advance(elapsedMs: 10_000) }
+    check(busy.takeAutoInteraction() == nil, "浮层播放期间不打断（这一轮不掷）")
+
+    // 关得掉
+    let off = pet([0.0, 0.0])
+    off.autoInteractMs = 0
+    for _ in 0..<10 { _ = off.advance(elapsedMs: 10_000) }
+    check(off.takeAutoInteraction() == nil, "autoInteractMs = 0 时彻底关闭")
+    check(PetAnimation.autoInteractActions == ["feed", "praise", "pat"],
+          "可自动触发的动作就是宿主 INTERACTIONS 里的那三个")
+}
+
 print("")
 if failures == 0 {
     print("全部通过（\(checks) 项检查）")

@@ -145,6 +145,12 @@ final class PetController: NSObject {
         let elapsedMs = Int((now - lastTickAt) * 1000)
         lastTickAt = now
         let dirty = animation.advance(elapsedMs: elapsedMs)
+        // 自己找点事做：状态维持够久、骰子也中了 —— 当成一次"用户点了互动"发给宿主。
+        // 台词与时长照旧由宿主决定（原生端只报动作），所以宿主那半不用改任何东西。
+        // 窗口收起来时不发：对着一个看不见的宠物演戏没有意义。
+        if let auto = animation.takeAutoInteraction(), window?.panel.isVisible == true {
+            emit(["kind": "interaction", "source": "auto", "action": auto])
+        }
         if let clip = animation.currentClip, clip.file != lastDrawnClip {
             lastDrawnClip = clip.file
             resizeForCurrentClip()

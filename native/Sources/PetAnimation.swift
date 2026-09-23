@@ -90,6 +90,29 @@ final class PetAnimation {
     var idleRotateMs: Int = 60000
     private var rotateAccumulatorMs = 0
     private var lastUsedByState: [PetState: String] = [:]
+
+    // MARK: - 自动互动（自己找点事做）
+
+    /// 连续停留多久掷一次骰子（毫秒）；<=0 关闭。
+    ///
+    /// 「停留」以**耐久状态**为准：宿主每条事件都会重发 state，值没变就继续攒，
+    /// 所以这里量的是"这个状态维持了多久"，而不是"多久没收到消息"。
+    var autoInteractMs: Int = 10_000
+    /// 每次掷骰子的触发概率。
+    var autoInteractChance: Double = 0.3
+    /// 可被自动触发的动作 —— 键与宿主 `INTERACTIONS` 对齐（台词与时长由宿主定）。
+    static let autoInteractActions = ["feed", "praise", "pat"]
+    /// 当前状态已经连续停留了多久（毫秒）。
+    private(set) var dwellMs = 0
+    /// 攒着还没被取走的自动互动（一次只攒一条，免得堆成连播）。
+    private var pendingAutoInteraction: String?
+
+    /// 取走一条待发的自动互动；取走即清空。拿它当"用户碰了它一下"处理即可。
+    func takeAutoInteraction() -> String? {
+        defer { pendingAutoInteraction = nil }
+        return pendingAutoInteraction
+    }
+
     /// 模拟时钟（毫秒）：脉冲/浮层的到期都以它为准，`advance` 是唯一的推进者。
     private var clockMs = 0
 
@@ -158,6 +181,8 @@ final class PetAnimation {
         if let detail { stateDetail = detail }
         pulse = nil
         rotateAccumulatorMs = 0
+        // 换了状态 → 停留时间从头算（"维持 10 秒"量的就是这一段）
+        if changed { dwellMs = 0 }
         // 浮层还在时不抢画面，等它到期再切回状态底图
         guard overlay == nil else { return }
         if changed || clipName.isEmpty {
@@ -167,7 +192,11 @@ final class PetAnimation {
 
     func applyPulse(state: PetState, ttlMs: Int, message: String?, resumeState: PetState?) {
         guard ttlMs > 0 else { return }
-        if let resumeState { self.state = resumeState }
+        // 脉冲本身是浮层，不改耐久状态；只有 resumeState 真的换了状态才算重新开始停留
+        if let resumeState {
+            if resumeState != self.state { dwellMs = 0 }
+            self.state = resumeState
+        }
         guard let chosen = pickVariant(forState: state, adopt: false) else { return }
         pulse = Layer(clipName: chosen, message: message, deadlineMs: clockMs + ttlMs)
         setClip(chosen)
@@ -187,6 +216,7 @@ final class PetAnimation {
     func advance(elapsedMs: Int) -> Bool {
         var dirty = false
         clockMs += max(0, elapsedMs)
+        accumulateAutoInteraction(elapsedMs)
 
         if expireNotices(elapsedMs: elapsedMs) { dirty = true }
 
@@ -276,6 +306,24 @@ final class PetAnimation {
     }
 
     // MARK: - 内部
+
+    /// 攒"当前状态维持了多久"，每满一个周期掷一次骰子。
+    ///
+    /// 两个不打扰的约定：浮层还在播（用户刚摸过它 / 上一条自动互动还没放完）时不掷，
+    /// 已经攒着一条没被取走时也不掷 —— 否则定时器被系统降频后一次性补算，
+    /// 会攒出好几条一起播。
+    private func accumulateAutoInteraction(_ elapsedMs: Int) {
+        guard elapsedMs > 0, autoInteractMs > 0 else { return }
+        dwellMs += elapsedMs
+        while dwellMs >= autoInteractMs {
+            dwellMs -= autoInteractMs
+            if overlay != nil || pendingAutoInteraction != nil { continue }
+            guard random() < autoInteractChance else { continue }
+            let count = Self.autoInteractActions.count
+            let index = min(count - 1, max(0, Int(random() * Double(count))))
+            pendingAutoInteraction = Self.autoInteractActions[index]
+        }
+    }
 
     /// 从某个状态的素材里随机挑一张（避开当前这张与上次该状态用过的）。
     @discardableResult
