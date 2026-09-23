@@ -9,11 +9,19 @@
 
 import { PetMessageKind, createMessage } from './protocol.js'
 
+/**
+ * 互动浮层至少播这么久（毫秒）。
+ *
+ * 动作素材都是 30 帧、循环播放，单段只有 0.9–3.0 秒；右键点一下只看一秒多会显得敷衍，
+ * 所以给一个下限 —— 短片段会自己再循环一遍，长片段也不会被这次的改动截短。
+ */
+export const MIN_INTERACTION_MS = 4000
+
 export const INTERACTIONS = Object.freeze({
-  pat: { lines: ['再摸一下就要收费啦', '头发会乱的', '嗯…手感还行吧'], ttlMs: 1800 },
-  poke: { lines: ['戳什么戳', '我在忙呢，别闹', '再戳就罢工给你看'], ttlMs: 1500 },
-  feed: { lines: ['好耶，是点心', '吃一口再干活', '这个我收下了', '啊呜，啊呜..再吃一口'], ttlMs: 2400 },
-  praise: { lines: ['被夸到了', '哼，算你有眼光', '那今天就多干一点'], ttlMs: 2200 },
+  pat: { lines: ['再摸一下就要收费啦', '头发会乱的', '嗯…手感还行吧'], ttlMs: 4000 },
+  poke: { lines: ['戳什么戳', '我在忙呢，别闹', '再戳就罢工给你看'], ttlMs: 4000 },
+  feed: { lines: ['好耶，是点心', '吃一口再干活', '这个我收下了', '啊呜，啊呜..再吃一口'], ttlMs: 4400 },
+  praise: { lines: ['被夸到了', '哼，算你有眼光', '那今天就多干一点'], ttlMs: 4200 },
 })
 
 /** 悬浮窗上的分区 → 互动动作。 */
@@ -50,13 +58,14 @@ export function interactionMessage(action, { seed = Math.random() * 1000, celebr
     return createMessage(PetMessageKind.OVERLAY, {
       action: 'praise',
       message: '诶嘿～最喜欢你了',
-      ttlMs: 2200,
+      ttlMs: MIN_INTERACTION_MS,
     })
   }
   return createMessage(PetMessageKind.OVERLAY, {
     action,
     message: pickLine(spec.lines, seed),
-    ttlMs: spec.ttlMs,
+    // 夹一道下限：以后改台词表也不会不小心让某个动作一闪而过
+    ttlMs: Math.max(MIN_INTERACTION_MS, spec.ttlMs),
   })
 }
 

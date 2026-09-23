@@ -4,7 +4,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
 import { PetMessageKind } from '../src/protocol.js'
-import { INTERACTIONS, createPatTracker, interactionMessage, pickLine, zoneToAction } from '../src/pet-interactions.js'
+import { INTERACTIONS, MIN_INTERACTION_MS, createPatTracker, interactionMessage, pickLine, zoneToAction } from '../src/pet-interactions.js'
 import { copyLibrary, parallelHeadline, rosterLine, singleDetail, statusCopy } from '../src/pet-copy.js'
 
 test('互动：每个动作都有台词与 ttl，未知动作返回 undefined', () => {
@@ -17,6 +17,23 @@ test('互动：每个动作都有台词与 ttl，未知动作返回 undefined', 
   }
   assert.equal(interactionMessage('unknown'), undefined)
   assert.equal(interactionMessage('home'), undefined, 'home/hide 是命令，不是浮层')
+})
+
+test('互动：浮层至少播 4 秒（含连点彩蛋那条）', () => {
+  assert.equal(MIN_INTERACTION_MS, 4000)
+  for (const [action, spec] of Object.entries(INTERACTIONS)) {
+    assert.ok(spec.ttlMs >= MIN_INTERACTION_MS, `${action} 的 ttlMs=${spec.ttlMs} 低于下限`)
+    assert.ok(interactionMessage(action, { seed: 1 }).ttlMs >= MIN_INTERACTION_MS, `${action} 下发时也要达标`)
+  }
+  assert.equal(interactionMessage('pat', { celebrate: true }).ttlMs, MIN_INTERACTION_MS, '彩蛋不短于下限')
+  // 台词表被改小也拦得住：夹取在 interactionMessage 里
+  const original = INTERACTIONS.poke.ttlMs
+  try {
+    INTERACTIONS.poke.ttlMs = 10
+    assert.equal(interactionMessage('poke').ttlMs, MIN_INTERACTION_MS, '夹取兜住下限')
+  } finally {
+    INTERACTIONS.poke.ttlMs = original
+  }
 })
 
 test('互动：同一个 seed 取到同一句，负 seed 也不会取到空', () => {
