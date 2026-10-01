@@ -29,5 +29,8 @@ docs/motion-samples/
 # SwiftPM（本项目不用 swift test，见 scripts/test-swift.sh 的说明）
 .build/
 
+# npm pack 的产物（44MB，发布用，不该进仓库）
+*.tgz
+
 # 注意：runtime/bin/ 里的编译产物**要进仓库**（用户选的是"开箱即用"，
 # 别人不用装 Xcode 就能跑）。所以这里刻意不忽略它。

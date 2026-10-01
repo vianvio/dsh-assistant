@@ -8,7 +8,7 @@
 
 [使用](#使用) · [外观与互动](#外观与互动) · [今天干了什么](#今天干了什么) · [参考与致谢](#参考与致谢) · [已知边界](#已知边界)
 
-![version](https://img.shields.io/badge/version-0.1.0-informational) · [![license](https://img.shields.io/badge/license-MIT-success)](LICENSE) · ![platform](https://img.shields.io/badge/platform-macOS%2013%2B-lightgrey) · ![DSH](https://img.shields.io/badge/DSH-plugin-4B6BFB)
+[![npm](https://img.shields.io/npm/v/dsh-assistant?label=npm)](https://www.npmjs.com/package/dsh-assistant) · [![license](https://img.shields.io/badge/license-MIT-success)](LICENSE) · ![platform](https://img.shields.io/badge/platform-macOS%2013%2B-lightgrey) · ![DSH](https://img.shields.io/badge/DSH-plugin-4B6BFB)
 
 </div>
 
@@ -19,8 +19,8 @@ DSH小助手不是需要单独启动的桌宠应用：它由 DSH 插件拉起，
 它只显示**真实发生的事**：状态来自 DSH 的会话事件 —— 不读屏幕、不根据模型名猜推理强度、
 也不编造完成度。几个项目一起跑时，气泡只给两行关键信息：谁在跑、谁在等你。
 
-> 当前版本 `0.1.0` · macOS（Apple Silicon / Intel 通用二进制）· 仓库自带编译好的 helper
-> 与素材包，clone 下来就能跑，不需要 Xcode
+> macOS（Apple Silicon / Intel 通用二进制）· 包里自带编译好的 helper 与素材包，
+> 装完就能跑，不需要 Xcode
 
 ## 状态展示
 
@@ -54,12 +54,14 @@ DSH小助手不是需要单独启动的桌宠应用：它由 DSH 插件拉起，
 ### 装到 DSH 里
 
 ```bash
-dsh plugin --profile desktop add github:vianvio/dsh-assistant
+dsh plugin --profile desktop add dsh-assistant
 ```
 
 `--profile` 填你实际在用的那个（桌面端是 `desktop`，Web 端是 `web`）。
 这条命令背后是 pnpm：装完包之后，它会**自动**把声明了 `dsh.bundle` 的依赖加进
 profile 的 `dsh.profile.bundles` —— 不用手改 `package.json`。
+
+包里带着编译好的 macOS helper 与素材包（44MB），装完就能跑，不需要 Xcode。
 
 重启 DSH 后，桌面右下角会出现宠物，设置面板里多一张「DSH小助手」卡片。
 
@@ -67,6 +69,14 @@ profile 的 `dsh.profile.bundles` —— 不用手改 `package.json`。
 
 ```bash
 dsh plugin --profile desktop update dsh-assistant
+```
+
+### 想跟着最新提交跑
+
+npm 上是发版快照；想用 GitHub 上最新的 `main`：
+
+```bash
+dsh plugin --profile desktop add github:vianvio/dsh-assistant
 ```
 
 ### 改这个插件本身
@@ -80,7 +90,7 @@ dsh plugin --profile desktop add link:$HOME/dsh-assistant
 
 ### 自己构建（可选）
 
-仓库里带了编译好的 macOS helper 与素材包，上面两种装法**都用不到这些命令**；
+包里带了编译好的 macOS helper 与素材包，上面三种装法**都用不到这些命令**；
 只有改了原生端或想换素材时才需要：
 
 ```bash
