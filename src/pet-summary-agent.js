@@ -19,6 +19,7 @@
 import { randomUUID } from 'node:crypto'
 
 import { createSessionDigests, projectSession } from './pet-summary-digest.js'
+import { createSessionActivityIndex, touchedToday } from './pet-summary-activity.js'
 
 const TIMEOUT_MS = 5 * 60 * 1000
 
@@ -27,7 +28,7 @@ const TIMEOUT_MS = 5 * 60 * 1000
  * 部分会话（fork/seeded 的、历史格式有瑕疵的）整段复现会失败，
  * 别让一整天都总结不出来。
  *
- * 三个关键点（都是实测出来的，别改回去）：
+ * 四个关键点（都是实测出来的，别改回去）：
  *
  *  1. **投影**：读到快照立刻折成 digest（`pet-summary-digest.js`），事件对象当场丢弃。
  *     旧实现把 179 个会话的快照全留在 Map 里 —— 1.09 GB 解压内容 ≈ 1.3 GB heap，
@@ -40,8 +41,13 @@ const TIMEOUT_MS = 5 * 60 * 1000
  *  3. **让出主线程**：整段读会话是同步 CPU（解压 + JSON.parse + surface 折叠），
  *     串行 179 个会把宿主的 15 秒心跳窗口吃掉。每个会话之间 `setImmediate` 一次，
  *     事件循环就不会被连续占住。
+ *
+ *  4. **首轮预筛（mtime）**：进程刚起来时缓存是空的，本来要把所有会话读一遍 ——
+ *     实测 160 个里只有 8 个今天动过。日志是追加写的，所以"文件 mtime 早于今天 0 点"
+ *     就等于"今天不可能有新内容"（`pet-summary-activity.js`，真机验证过 0 反例）。
+ *     **定位不到文件就照读**，宁可慢不能漏。
  */
-export async function collectSessions(ctx, logger = console, { digests } = {}) {
+export async function collectSessions(ctx, logger = console, { digests, activity, onYield } = {}) {
   const sessionQuery = ctx?.get?.('sessionQuery')
   const agents = ctx?.get?.('agents')
   if (!sessionQuery || !agents) {
@@ -50,12 +56,17 @@ export async function collectSessions(ctx, logger = console, { digests } = {}) {
 
   // 没有传缓存就每轮新建一份（等价于旧行为：每次都全读）—— 测试与一次性调用走这条
   const cache = digests ?? createSessionDigests()
+  // 没有传索引就自己建一个（默认 $DSH_HOME/sessions，失败即"没有信号"）
+  const files = activity ?? createSessionActivityIndex()
+  // 让出方式可注入：测试要能数"让出了几次"，而不是靠时间窗口去碰运气
+  const pause = onYield ?? yieldToLoop
   // 扫描**开始**就取走脏集：扫描期间新到的事件留给下一轮（这一轮的摘要已经不含它们）
   const pending = cache.takeDirty()
   const since = cache.windowStart
   const records = await sessionQuery.listSessions()
   const ids = []
   const usable = []
+  let skipped = 0
 
   for (const record of records) {
     const header = record?.header ?? record
@@ -64,6 +75,11 @@ export async function collectSessions(ctx, logger = console, { digests } = {}) {
     ids.push(id)
     if (cache.has(id) && !pending.has(id)) {
       if (cache.get(id).messages.length > 0) usable.push(id)
+      continue
+    }
+    // 首轮预筛：今天不可能有新内容的会话直接不看（缓存里也没有它，下轮还会再判一次）
+    if (!cache.has(id) && !touchedToday(header, record?.live === true, files, since)) {
+      skipped += 1
       continue
     }
     cache.reads += 1
@@ -91,17 +107,22 @@ export async function collectSessions(ctx, logger = console, { digests } = {}) {
       if (!recovered) logger.warn?.(`dsh-assistant: 跳过会话 ${id}: ${reason}`)
     } finally {
       // 让出主线程：否则连读几十个会话时，宿主的定时器/心跳会被整体推迟
-      await yieldToLoop()
+      await pause()
     }
   }
 
   // 标题只对"真有今天内容的会话"读：标题是锦上添花，没必要为 179 个会话各折一次语料
   const titles = await readTitles(sessionQuery, usable, logger)
+  // 留一条可查的账：首轮预筛跳了多少、实际读了多少（"日报怎么变快了"要能一眼看懂）
+  logger.debug?.(
+    `dsh-assistant: 总结扫描：读 ${cache.reads} 个（含缓存命中后的重读），`
+    + `按 mtime 预筛跳过 ${skipped} 个，缓存 ${cache.stats.size} 个会话`,
+  )
   return { records, digests: cache, titleOf: (id) => titles.get(String(id)) }
 }
 
 /** 把主线程让出去一轮（见 collectSessions 的第 3 条）。 */
-function yieldToLoop() {
+export function yieldToLoop() {
   return new Promise((resolve) => setImmediate(resolve))
 }
 

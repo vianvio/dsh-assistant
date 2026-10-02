@@ -6,7 +6,7 @@
  */
 
 import assert from 'node:assert/strict'
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -26,8 +26,9 @@ import {
   startOfToday,
   summaryRules,
 } from '../src/pet-summary-corpus.js'
-import { collectSessions, runHiddenSession } from '../src/pet-summary-agent.js'
+import { collectSessions, runHiddenSession, yieldToLoop } from '../src/pet-summary-agent.js'
 import { SessionDigests, projectSession } from '../src/pet-summary-digest.js'
+import { createSessionActivityIndex, touchedToday } from '../src/pet-summary-activity.js'
 import { generateTodaySummary, generateTodaySummaryStepped, refinePendingParts } from '../src/pet-summary.js'
 import { appendPart, partsFor, readStore, storePath, summarizedUntil, writeStore } from '../src/pet-summary-store.js'
 
@@ -438,11 +439,95 @@ test('扫描：每个会话之间把事件循环让出去（否则宿主心跳�
   ]))
   const { ctx } = fakeCtx({ records, snapshots, titles: new Map() })
 
-  let yielded = 0
-  const ticker = setInterval(() => { yielded += 1 }, 0)
-  await collectSessions(ctx, quiet, { digests: new SessionDigests() })
-  clearInterval(ticker)
-  assert.ok(yielded > 0, '扫描期间别的时间源必须能跑（这里靠 setImmediate 让出）')
+  // 数"让出了几次"，而不是用定时器碰运气：读几个会话就该让出几次
+  const yields = []
+  const digests = new SessionDigests()
+  await collectSessions(ctx, quiet, { digests, onYield: async () => { yields.push(digests.reads) } })
+  assert.deepEqual(yields, [1, 2, 3, 4, 5], '每个会话读完都让出一次（且是在读完那一刻）')
+  assert.equal(yieldToLoop() instanceof Promise, true, '默认实现必须是异步的')
+})
+
+/* ------------------------------------------------- 首轮预筛（mtime 索引，D） */
+
+test('预筛：按目录名能定位到会话文件（两种命名都要认）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-assistant-activity-'))
+  try {
+    const root = join(dir, 'sessions')
+    const write = (slug, key, file, mtime) => {
+      mkdirSync(join(root, slug, key), { recursive: true })
+      const path = join(root, slug, key, file)
+      writeFileSync(path, 'x')
+      utimesSync(path, mtime / 1000, mtime / 1000)
+    }
+    const today = Date.now()
+    const old = today - 3 * 86400_000
+    write('--Users-vian-Documents-a--', 'aaaa-1111', 'session.v3.jsonl.zstd', today)   // v3：裸 id
+    write('--Users-vian-Documents-b--', 'session-bbbb-2222', 'session.jsonl.zstd', old) // v0：带前缀
+    write('--Users-vian-Documents-c--', 'cccc-3333', 'session.v3.jsonl.zstd', old)
+
+    const index = createSessionActivityIndex({ root, now: () => today })
+    assert.equal(index.mtimeOf('aaaa-1111'), today, 'v3 裸 id 能定位')
+    assert.equal(index.mtimeOf('bbbb-2222'), old, '给不带前缀的 id 也要能定位到带前缀的目录')
+    assert.equal(index.mtimeOf('session-bbbb-2222'), old, '带前缀的 id 同样能定位')
+    assert.equal(index.mtimeOf('nope'), undefined, '定位不到 → undefined（调用方照读）')
+    assert.equal(index.stats.entries, 3)
+
+    // 目录不存在（比如换了 DSH_HOME）：没有信号，不是错误
+    const missing = createSessionActivityIndex({ root: join(dir, 'nowhere'), now: () => today })
+    assert.equal(missing.mtimeOf('aaaa-1111'), undefined)
+    assert.equal(missing.stats.entries, 0)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('预筛判定：今天新建 / 今天动过 / live / 不知道 → 都要读', () => {
+  const today = new Date()
+  today.setHours(12, 0, 0, 0)
+  const since = startOfToday(today.getTime())
+  const yesterday = since - 3600_000
+
+  const activity = { mtimeOf: (id) => ({ today: since, old: yesterday })[id] }
+  assert.equal(touchedToday({ id: 'today', createdAt: yesterday }, false, activity, since), true, '今天写过日志 → 读')
+  assert.equal(touchedToday({ id: 'old', createdAt: yesterday }, false, activity, since), false, '今天没写过 → 跳过')
+  assert.equal(touchedToday({ id: 'old', createdAt: since + 1000 }, false, activity, since), true, '今天新建的 → 读')
+  assert.equal(touchedToday({ id: 'old', createdAt: yesterday }, true, activity, since), true, '内存里的会话可能还没落盘 → 读')
+  assert.equal(touchedToday({ id: 'unknown', createdAt: yesterday }, false, activity, since), true, '定位不到 → 照读（宁可慢不能漏）')
+  assert.equal(touchedToday({ id: 'old', createdAt: yesterday }, false, undefined, since), true, '没有索引 → 照读')
+})
+
+test('预筛接进扫描：老会话不读，今天动过的读（读的个数要掉一个数量级）', async () => {
+  const now = Date.now()
+  const since = startOfToday(now)
+  const records = [
+    { header: { id: 'active', createdAt: now - 3600_000, cwd: '/p/a' }, live: true },
+    { header: { id: 'logged', createdAt: now - 3600_000, cwd: '/p/b' }, live: false, persisted: true },
+    { header: { id: 'stale', createdAt: now - 30 * 86400_000, cwd: '/p/c' }, live: false, persisted: true },
+    { header: { id: 'unknown', createdAt: now - 30 * 86400_000, cwd: '/p/d' }, live: false, persisted: true },
+  ]
+  const event = (text) => ({ type: 'user/message', time: now, data: { source: { kind: 'user' }, content: [{ type: 'text', text }] } })
+  const snapshots = new Map([
+    ['active', { events: [event('内存里的会话')] }],
+    ['logged', { events: [event('今天写过日志')] }],
+    ['stale', { events: [event('其实今天也在说话（反例）')] }],
+    ['unknown', { events: [event('定位不到文件')] }],
+  ])
+  const { ctx, calls } = fakeCtx({ records, snapshots, titles: new Map() })
+  const activity = { mtimeOf: (id) => (id === 'logged' ? since : id === 'stale' ? since - 86400_000 : undefined) }
+
+  const { digests } = await collectSessions(ctx, quiet, { digests: new SessionDigests(), activity })
+  assert.deepEqual(calls.readSession.sort(), ['active', 'logged', 'unknown'], '只跳过"确实没动过"的那个')
+  assert.ok(digests.has('active') && digests.has('logged') && digests.has('unknown'))
+  assert.ok(!digests.has('stale'), '被跳过的会话不进缓存（下轮还会再判一次）')
+
+  // 第二轮：一个都没变 → 一个都不重读（预筛/缓存都不该额外读）
+  await collectSessions(ctx, quiet, { digests, activity })
+  assert.deepEqual(calls.readSession.sort(), ['active', 'logged', 'unknown'], '缓存命中 + 预筛跳过 = 0 次读')
+
+  // 标脏的那个才重读
+  digests.touch('active')
+  await collectSessions(ctx, quiet, { digests, activity })
+  assert.deepEqual(calls.readSession.sort(), ['active', 'active', 'logged', 'unknown'], '只有变过的重读')
 })
 
 /* ------------------------------------------------------- 水位存储 */
