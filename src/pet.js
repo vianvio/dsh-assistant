@@ -14,7 +14,7 @@ import { PetProcess, defaultAssetRoot, helperAvailable } from './pet-process.js'
 import { PetReducer } from './pet-reducer.js'
 import { sessionId } from './events.js'
 import { INTERACTIONS, createPatTracker, interactionMessage, zoneToAction } from './pet-interactions.js'
-import { generateTodaySummary, generateTodaySummaryStepped, refinePendingParts } from './pet-summary.js'
+import { generateTodaySummary, generateTodaySummaryStepped, refinePendingParts, summaryHint } from './pet-summary.js'
 import { createSessionDigests } from './pet-summary-digest.js'
 import { reportLengthWarning } from './pet-summary-corpus.js'
 import { PetMessageKind, PetState, createMessage } from './protocol.js'
@@ -262,7 +262,13 @@ export function mountPet({ ctx, settings, eventCtx, logger = console, tuning = {
       const title = `今天干了什么 · ${new Date().toLocaleDateString('zh-CN')}`
       // 先清进度条，再挂正文 + 可点击通知（点击开弹窗）
       send(createMessage(PetMessageKind.NOTICE_CLEAR, { id: progressId, reason: 'done' }))
-      send(createMessage(PetMessageKind.SUMMARY, { title, markdown }))
+      // hint 是给结果页底部那行提示用的（后台总结关着时告诉用户有开关）：
+      // 正文一个字都不加 —— 日报会被复制出去，提示不该混进去
+      send(createMessage(PetMessageKind.SUMMARY, {
+        title,
+        markdown,
+        hint: summaryHint(settings.get()),
+      }))
       send(createMessage(PetMessageKind.NOTICE, {
         id: `summary:${new Date().toDateString()}`,
         project: '今日总结',

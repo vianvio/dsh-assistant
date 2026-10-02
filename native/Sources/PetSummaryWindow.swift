@@ -13,9 +13,14 @@ final class PetSummaryWindow {
     private var textView: NSTextView?
     private var rawMarkdown = ""
     private let copyButton = NSButton()
+    /// 底部那行提示（空 = 这一格收起来，不占高度）。
+    private let hintLabel = NSTextField(wrappingLabelWithString: "")
 
     /// 打开（或复用）总结窗并显示内容。
-    func present(title: String, markdown: String) {
+    ///
+    /// `hint` 是**结果页的提示行**，不是正文的一部分：正文会被「复制 Markdown」
+    /// 带走（用户要贴进日报），提示混进去就脏了 —— 所以它在窗口 chrome 上另起一行。
+    func present(title: String, markdown: String, hint: String = "") {
         rawMarkdown = markdown
         let panel = self.panel ?? makePanel()
         self.panel = panel
@@ -24,6 +29,11 @@ final class PetSummaryWindow {
         textView?.textStorage?.setAttributedString(render(markdown))
         textView?.scrollToBeginningOfDocument(nil)
         copyButton.title = "复制 Markdown"
+
+        let text = PetSummaryText.hint(hint)
+        hintLabel.stringValue = text
+        // 收起时由 NSStackView 自动不占高度；每次打开都要重设（开关状态会变）
+        hintLabel.isHidden = text.isEmpty
 
         // 先激活、再上浮：配件型进程的 activate 是异步的，顺序反了会把面板
         // 丢到另一个 Space 上去（用户看到的是"点了没反应"）。
@@ -44,6 +54,8 @@ final class PetSummaryWindow {
             "alpha": panel.alphaValue,
             "level": panel.level.rawValue,
             "hidesOnDeactivate": panel.hidesOnDeactivate,
+            // 提示行是否真的上屏（"说明文案有没有显示"从外面看不到，只能自报）
+            "hint": hintLabel.stringValue,
         ]
     }
 
@@ -122,14 +134,33 @@ final class PetSummaryWindow {
 
         content.addSubview(header)
         content.addSubview(scroll)
+
+        // 底部提示：默认空（收起来），宿主按"后台总结有没有开"决定发不发。
+        // 放进竖直 stack 是为了隐藏时自动不占高度 —— 手写约束得再维护一套零高度分支。
+        hintLabel.font = .systemFont(ofSize: 11)
+        hintLabel.textColor = .secondaryLabelColor
+        hintLabel.isSelectable = true
+        hintLabel.isHidden = true
+        hintLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        let body = NSStackView(views: [scroll, hintLabel])
+        body.orientation = .vertical
+        body.alignment = .leading
+        body.spacing = 8
+        body.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(body)
+
         NSLayoutConstraint.activate([
             header.topAnchor.constraint(equalTo: content.topAnchor),
             header.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             header.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            scroll.topAnchor.constraint(equalTo: header.bottomAnchor),
-            scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 14),
-            scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -14),
-            scroll.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -14),
+            body.topAnchor.constraint(equalTo: header.bottomAnchor),
+            body.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 14),
+            body.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -14),
+            body.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -14),
+            // 竖直 stack 里两个子视图各自撑满宽度（否则提示行会按自然宽度左对齐）
+            scroll.widthAnchor.constraint(equalTo: body.widthAnchor),
+            hintLabel.widthAnchor.constraint(equalTo: body.widthAnchor),
         ])
 
         panel.contentView = content

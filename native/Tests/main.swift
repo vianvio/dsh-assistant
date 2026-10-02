@@ -373,6 +373,17 @@ do {
     check(pet.notices.first?.clickAction == .dismiss, "空 sessionId 不能发出切会话指令")
 }
 
+// 6.5) 结果页底部提示：规范化的规则只有一份（PetSummaryText）
+do {
+    check(PetSummaryText.hint(nil).isEmpty, "没有提示 → 空（这一行收起来）")
+    check(PetSummaryText.hint("").isEmpty, "空串 → 空")
+    check(PetSummaryText.hint("   \n\t ").isEmpty, "只有空白 → 也算没有提示")
+    let text = "这次是全量重读今天的所有会话。在「设置 → 桌面宠物」里打开「任务后台总结」后，"
+        + "每次会话压缩会顺手提炼并留存，「今日总结」只补最后没压缩的增量。"
+    check(PetSummaryText.hint("  \(text)\n") == text, "有内容就原样保留（只去首尾空白）")
+    check(PetSummaryText.hint(text).contains("任务后台总结"), "提示要点名那个开关")
+}
+
 // 7) 气泡 / 窗口几何：测量与绘制同源（PetMetrics 是唯一算式）
 do {
     let canvas = manifest.canvas

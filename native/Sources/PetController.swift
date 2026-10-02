@@ -91,6 +91,10 @@ final class PetController: NSObject {
     /// 「今天干了什么」的正文（本地持有，点通知/菜单打开弹窗）
     private var summaryTitle = "今天干了什么"
     private var summaryMarkdown = ""
+    /// 结果页底部那行提示（宿主按"后台总结开没开"决定发不发，空 = 不显示）。
+    ///
+    /// 刻意不写进正文：正文会被「复制 Markdown」带走，提示混进去会污染日报。
+    private var summaryHint = ""
     private let summaryWindow = PetSummaryWindow()
 
     private var lastDrawnClip: String?
@@ -551,9 +555,11 @@ final class PetController: NSObject {
     private func handleSummary(_ message: [String: Any]) {
         summaryTitle = PetProtocol.stringValue(message["title"]) ?? "今天干了什么"
         summaryMarkdown = PetProtocol.stringValue(message["markdown"]) ?? ""
+        // 底部提示随正文一起换：宿主每次都会重发（后台总结开关的状态可能变了）
+        summaryHint = PetSummaryText.hint(PetProtocol.stringValue(message["hint"]))
         // 回执：宿主/探针据此确认消息真的到了（不是"发了但没人收"）
         emit(["kind": "interaction", "source": "host", "action": "summary-stored",
-              "chars": summaryMarkdown.count])
+              "chars": summaryMarkdown.count, "hintChars": summaryHint.count])
     }
 
     private func openSummary() {
@@ -561,7 +567,7 @@ final class PetController: NSObject {
             emit(["kind": "interaction", "source": "menu", "action": "summary-empty"])
             return
         }
-        summaryWindow.present(title: summaryTitle, markdown: summaryMarkdown)
+        summaryWindow.present(title: summaryTitle, markdown: summaryMarkdown, hint: summaryHint)
         emit(["kind": "interaction", "source": "menu", "action": "summary-opened",
               "panel": summaryWindow.debugInfo])
     }

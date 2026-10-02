@@ -65,9 +65,12 @@ final class PetHeadless {
             if let value = PetProtocol.doubleValue(message["scale"]) { scale = min(2.0, max(0.15, value)) }
             if let value = message["bubbleEnabled"] as? Bool { bubbleEnabled = value }
         case "summary":
-            // 与 PetController 同一条回执：宿主/探针据此确认正文真的到了
+            // 与 PetController 同一条回执：宿主/探针据此确认正文真的到了。
+            // hintChars = 结果页底部那行提示（后台总结关着时宿主才会发）
+            let hint = PetSummaryText.hint(PetProtocol.stringValue(message["hint"]))
             channel.send(["kind": "interaction", "source": "host", "action": "summary-stored",
-                          "chars": (PetProtocol.stringValue(message["markdown"]) ?? "").count])
+                          "chars": (PetProtocol.stringValue(message["markdown"]) ?? "").count,
+                          "hintChars": hint.count])
         case "command":
             break
         case "ping":

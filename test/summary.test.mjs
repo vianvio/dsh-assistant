@@ -29,7 +29,7 @@ import {
 import { collectSessions, runHiddenSession, yieldToLoop } from '../src/pet-summary-agent.js'
 import { SessionDigests, projectSession } from '../src/pet-summary-digest.js'
 import { createSessionActivityIndex, touchedToday } from '../src/pet-summary-activity.js'
-import { generateTodaySummary, generateTodaySummaryStepped, refinePendingParts } from '../src/pet-summary.js'
+import { generateTodaySummary, generateTodaySummaryStepped, refinePendingParts, summaryHint } from '../src/pet-summary.js'
 import { appendPart, partsFor, readStore, storePath, summarizedUntil, writeStore } from '../src/pet-summary-store.js'
 
 const quiet = { info() {}, warn() {}, error() {}, debug() {} }
@@ -528,6 +528,20 @@ test('预筛接进扫描：老会话不读，今天动过的读（读的个数�
   digests.touch('active')
   await collectSessions(ctx, quiet, { digests, activity })
   assert.deepEqual(calls.readSession.sort(), ['active', 'active', 'logged', 'unknown'], '只有变过的重读')
+})
+
+/* ------------------------------------------------- 结果页提示（后台总结开关） */
+
+test('结果页提示：后台总结关着（默认）时给一行开关说明，开着时不给', () => {
+  const off = summaryHint({ backgroundSummary: false })
+  assert.ok(off.length > 0, '默认是这个状态，结果页必须有一句说明')
+  assert.match(off, /任务后台总结/, '要点名那个开关叫什么')
+  assert.match(off, /桌面宠物/, '要说清它在设置面板的哪张卡里')
+  assert.match(off, /压缩/, '要说明开关打开后是靠"每次压缩顺手留存"')
+
+  assert.equal(summaryHint({ backgroundSummary: true }), '', '开着就别再念（噪音）')
+  assert.ok(summaryHint().length > 0, '没给设置时按默认（关）处理')
+  assert.equal(summaryHint({ backgroundSummary: 'true' }), summaryHint(), '只认真正的 true，字符串不算')
 })
 
 /* ------------------------------------------------------- 水位存储 */

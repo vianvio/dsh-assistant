@@ -23,6 +23,22 @@ import { collectSessions, runHiddenSession } from './pet-summary-agent.js'
 import { appendPart, storePath, summarizedUntil } from './pet-summary-store.js'
 
 /**
+ * 结果页底部那行提示：**后台总结没开**时，说明有个开关可以打开。
+ *
+ * 后台总结默认关（见 `pet-settings.js` 的默认值）。关着走的是"全量重读今天所有会话"
+ * 那条路径，用户能感觉到的只有慢 —— 结果页不写一句，就没人知道还有另一档。
+ * 反过来开着的时候**不要再念**：那是噪音，也会让人以为每次都得去点一下。
+ *
+ * 措辞对齐设置面板：卡片叫「桌面宠物」，开关叫「任务后台总结」。
+ */
+export function summaryHint({ backgroundSummary } = {}) {
+  if (backgroundSummary === true) return ''
+  return '这次是全量重读今天的所有会话。在「设置 → 桌面宠物」里打开「任务后台总结」后，'
+    + '每次会话压缩会顺手提炼并留存，「今日总结」只补最后没压缩的增量：更快、更省，'
+    + '多个会话也不会互相干扰。'
+}
+
+/**
  * 全量模式：所有会话一个 prompt。
  *
  * @returns {Promise<{ markdown: string, sessions: number }>}

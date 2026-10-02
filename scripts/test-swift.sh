@@ -20,6 +20,7 @@ swiftc -swift-version 5 -O \
   "$ROOT/native/Sources/PetState.swift" \
   "$ROOT/native/Sources/PetMetrics.swift" \
   "$ROOT/native/Sources/PetLayout.swift" \
+  "$ROOT/native/Sources/PetSummaryText.swift" \
   "$ROOT/native/Tests/main.swift" \
   -o "$OUT"
 
