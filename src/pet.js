@@ -35,6 +35,14 @@ export function mountPet({ ctx, settings, eventCtx, logger = console, tuning = {
 
   let process
   let reducer
+  /**
+   * 这一次 ready 是不是"进程刚起来的那一次"。
+   *
+   * 首次 ready 时下面的 config/hello/state 已经在补发队列里了，不用重复发；
+   * 之后的每一次 ready 都是**换了个新 helper**（心跳超时被杀 / 崩溃重启），
+   * 它是个空进程：没有排队消息要补的时候，桌面上的气泡会一直空着。
+   */
+  let readyOnce = false
 
   const startProcess = (resolved) => {
     if (resolved.enabled === false) {
@@ -51,6 +59,21 @@ export function mountPet({ ctx, settings, eventCtx, logger = console, tuning = {
     process = new PetProcess({
       ...(tuning.processOptions ?? {}),
       assetRoot: defaultAssetRoot(),
+      onReady: () => {
+        if (!readyOnce) {
+          readyOnce = true
+          return
+        }
+        // 新 helper 上线：把"当前该显示什么"整份补一遍（快照语义，重复发无害）。
+        logger.info?.('dsh-assistant: helper 重新就绪，已补发当前画面')
+        process.send(configMessage(settings.get(), settings))
+        process.send(createMessage(PetMessageKind.HELLO, {
+          label: '桌面宠物',
+          version: tuning.version ?? '0.0.0',
+        }))
+        // 快照自己去重，这里强制要一份：没有跑着的项目时它给的就是待机文案
+        for (const message of reducer?.snapshot?.() ?? []) process.send(message)
+      },
     }, logger)
     reducer = new PetReducer({ includeSubagents: resolved.includeSubagents })
     process.options.onMessage = (message) => handleHelperMessage(message)
@@ -73,6 +96,8 @@ export function mountPet({ ctx, settings, eventCtx, logger = console, tuning = {
     process?.stop(reason)
     process = undefined
     reducer = undefined
+    // 下次 startProcess 会自己把首帧发一遍，别让 onReady 再补一次
+    readyOnce = false
   }
 
   /** 发给原生端的消息（进程不在就丢掉）。 */

@@ -8,6 +8,11 @@
  *      同时监听 stdin 关闭，helper 自己也会退出（双保险）；
  *   4. **半死连接**：心跳 ping/pong，超时即判定掉线并重启。
  *
+ * 四类问题里最容易漏掉的是「重启之后能不能自愈」：写通道的背压状态是**实例级**的，
+ * 而子进程是**可换**的 —— 两者不绑在一起，一次背压就能让后面每个新 helper 都收不到
+ * 一个字节（见 start() 里 writeBlocked 的复位说明）。心跳同理：定时器后移说明**宿主**
+ * 自己卡了，不能算成 helper 不回话（见 #startHeartbeat）。
+ *
  * 进程模型：helper 是独立 AppKit 进程，靠 stdin/stdout 上的 JSON 行通信；
  * 它崩溃绝不影响 DSH（所有子进程通道都挂了 error 兜底）。
  */
@@ -80,6 +85,8 @@ export class PetProcess {
     this.lastPingAt = 0
     this.pongs = 0
     this.writeBlocked = false
+    /** 上一次心跳巡检的时刻（用来分辨"helper 不回话"和"宿主自己被卡住"）。 */
+    this.lastHeartbeatTickAt = 0
   }
 
   get pid() { return this.child?.pid }
@@ -124,6 +131,14 @@ export class PetProcess {
 
     this.child = child
     this.ready = false
+    // 换子进程 = 换了一条 stdin，写阻塞标记必须跟着复位。
+    //
+    // 不复位的后果是**永久性**的：上一轮一旦撞上背压（write 返回 false、等 drain），
+    // 而那个子进程在 drain 之前就没了（心跳超时被杀 / 重启），标记就再也没人翻回来；
+    // 之后每条消息（连心跳 ping 在内）都只进 pending，永远写不出去 ——
+    // 现象：新 helper 一个字节都收不到 → 不回 pong → 每十几秒被杀一次，
+    // 而气泡文案（state 消息）也永远停在初始状态。2026-10-01 那天刷了 591 次。
+    this.writeBlocked = false
     for (const stream of [child.stdin, child.stdout, child.stderr]) {
       stream.on('error', () => { /* 通道断裂不能冒泡到宿主 */ })
     }
@@ -215,6 +230,9 @@ export class PetProcess {
     if (child.stdin.write(line)) return
     this.writeBlocked = true
     child.stdin.once('drain', () => {
+      // 旧 child 的 drain 与新 child 无关：换过进程就别再动这一轮的标记，
+      // 否则新进程的背压会被上一轮的 drain 提前清掉（或者反过来，永远清不掉）。
+      if (this.child !== child) return
       this.writeBlocked = false
       this.#flush()
     })
@@ -238,6 +256,9 @@ export class PetProcess {
         this.#clearStartup()
         this.#flush()
         this.#startHeartbeat()
+        // 补发顺序：先把排队时攒下的消息写出去，再叫宿主补一份"当前画面"的快照 ——
+        // 新 helper 是个空进程，没有历史文案，光靠排队消息会一直停在挂起前那一帧。
+        this.#notifyReady()
         break
       case PetMessageKind.PONG: {
         // 心跳不进业务消息通道：它只反映通道健康度，由 onHeartbeat 单独暴露
@@ -272,14 +293,26 @@ export class PetProcess {
     const interval = this.options.heartbeatMs ?? 5000
     if (interval <= 0) return
     const timeout = this.options.heartbeatTimeoutMs ?? interval * 3
+    this.lastHeartbeatTickAt = Date.now()
     this.heartbeatTimer = setInterval(() => {
+      const now = Date.now()
+      const gap = now - this.lastHeartbeatTickAt
+      this.lastHeartbeatTickAt = now
       if (!this.isRunning) return
-      if (Date.now() - this.lastPongAt > timeout) {
+      // 定时器整体后移 = **宿主自己**的主线程被占住了（重活 / 卡顿），不是 helper 不回话。
+      // 这时候按"距上次 pong 太久"判超时，恢复后的第一跳就会把一个健康的 helper 判死；
+      // 那一刀之后通道还能不能自愈，取决于写阻塞标记有没有复位（见 start()）。
+      // 所以这里把基准补到"现在"，跳过这一轮，下一轮正常发 ping。
+      if (gap > interval * 2) {
+        this.lastPongAt = now
+        return
+      }
+      if (now - this.lastPongAt > timeout) {
         this.logger.warn?.('dsh-assistant: helper 心跳超时，重启')
         this.child?.kill()
         return
       }
-      this.lastPingAt = Date.now()
+      this.lastPingAt = now
       this.send({ v: 1, kind: PetMessageKind.PING, ts: this.lastPingAt })
     }, interval)
     this.heartbeatTimer.unref?.()
@@ -309,6 +342,21 @@ export class PetProcess {
   #clearStartup() {
     if (this.startupTimer) clearTimeout(this.startupTimer)
     this.startupTimer = undefined
+  }
+
+  /**
+   * 通知宿主"新 helper 上线了"（`onReady`）。
+   *
+   * 留给宿主补一份当前快照（配置 / 称呼 / 状态文案）：helper 重启后是个空进程，
+   * 没有排队消息要补的时候（半天没人动过），桌面上就是"没有气泡"的一只宠物 ——
+   * 而 run 还在跑。回调里抛异常不牵连通路，记一条日志就够了。
+   */
+  #notifyReady() {
+    try {
+      this.options.onReady?.()
+    } catch (error) {
+      this.logger.warn?.(`dsh-assistant: onReady 回调失败: ${error instanceof Error ? error.message : String(error)}`)
+    }
   }
 
   #clearTimers() {

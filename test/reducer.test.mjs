@@ -42,6 +42,28 @@ test('归约：回合开始→思考，工具调用→工作，结束→庆祝�
   assert.ok(pulse.ttlMs >= 2000)
 })
 
+test('归约：snapshot 强制重发当前画面（换 helper 时新进程是空的）', () => {
+  const reducer = new PetReducer()
+  reducer.handle(session(), { type: 'turn/start', seq: 1 })
+  const first = reducer.snapshot()
+  assert.equal(first.length, 1, '该给一条 state')
+  assert.equal(first[0].kind, PetMessageKind.STATE)
+  // 画面没变时普通路径什么都不发（签名去重），这正是新 helper 会饿死的地方
+  assert.deepEqual(reducer.handle(session(), { type: 'something/else', seq: 2 }), [])
+  const { ts: _before, ...beforeBody } = first[0]
+  const { ts: _after, ...afterBody } = reducer.snapshot()[0]
+  assert.deepEqual(afterBody, beforeBody, 'snapshot 必须无视签名去重，原样补一份')
+})
+
+test('归约：没有任何项目时 snapshot 也给一条待机文案', () => {
+  const reducer = new PetReducer()
+  const messages = reducer.snapshot()
+  assert.equal(messages.length, 1)
+  assert.equal(messages[0].kind, PetMessageKind.STATE)
+  assert.equal(messages[0].state, PetState.IDLE)
+  assert.ok(String(messages[0].message).length > 0, '待机也要有文案，否则桌面上是个没气泡的宠物')
+})
+
 test('归约：庆祝停留态由 tick 回落（2.2s 后回到待机）', () => {
   const reducer = new PetReducer()
   reducer.handle(session(), { type: 'turn/start', seq: 1 })

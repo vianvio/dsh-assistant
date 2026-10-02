@@ -250,6 +250,16 @@ export class PetReducer {
     return changed ? this.#render() : []
   }
 
+  /**
+   * 强制重渲染一份"当前画面"（忽略签名去重）。
+   *
+   * 给"换了个新 helper"用：新进程没有历史文案，而签名去重会让本该重发的那条
+   * `state` 被吞掉（`#render` 认为"没变化"）—— 桌面上的表现就是气泡一直空着。
+   */
+  snapshot() {
+    return this.#render({ force: true })
+  }
+
   /** 当前主角项目（供宿主 / 设置面板查询）。 */
   focus() {
     const entry = this.#focus()

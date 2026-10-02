@@ -6,7 +6,9 @@
  */
 
 import assert from 'node:assert/strict'
-import { resolve, dirname } from 'node:path'
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { resolve, dirname, join } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 
@@ -63,6 +65,161 @@ test('进程：握手 → 心跳 → 优雅退出（含状态下发）', { skip:
   process.stop('test-done')
   assert.ok(await waitFor(() => !process.child, 6000), 'stop 后进程应已退出')
 })
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 下面三组用「假 helper」跑：协议的坑（写阻塞、心跳误判、重启补快照）
+// 不该只能靠真 helper + 观察桌面才能发现，而在 CI 里它们必须是确定性用例。
+// ─────────────────────────────────────────────────────────────────────────────
+
+test('进程：写阻塞标记换进程后必须复位（否则重启也救不回来）', async () => {
+  const fixture = makeFakeHelper({ readDelayMs: 1500 })
+  try {
+    const process_ = new PetProcess({
+      helperPath: fixture.shim,
+      heartbeatMs: 4000,
+      restartDelayMs: 30,
+      env: { FAKE_HELPER_LOG: fixture.log },
+    }, quiet)
+
+    process_.start()
+    assert.ok(await waitFor(() => process_.isRunning, 5000), '假 helper 未就绪')
+    const firstPid = process_.pid
+
+    // 对端还堵在 readDelayMs 里没读 stdin → 这条大消息必然触发背压
+    process_.send(createMessage(PetMessageKind.SUMMARY, { title: '压测', markdown: 'x'.repeat(512 * 1024) }))
+    assert.ok(
+      await waitFor(() => process_.writeBlocked === true, 2000),
+      '大消息没触发背压，用例失去意义',
+    )
+
+    // 心跳超时那条路：宿主把 helper 杀掉，换个新的
+    process_.child.kill()
+    assert.ok(
+      await waitFor(() => process_.isRunning && process_.pid !== firstPid, 6000),
+      'helper 没有重启',
+    )
+
+    // 新 helper 是好的：ping 必须真的写进去（旧实现里它一条都收不到）
+    process_.send(createMessage(PetMessageKind.PING, { ts: Date.now() }))
+    assert.ok(
+      await waitFor(() => fixture.received().some((line) => line.includes('"ping"')), 5000),
+      `新 helper 一条消息都没收到：${JSON.stringify(fixture.received())}`,
+    )
+    assert.ok(await waitFor(() => process_.heartbeat.pongs >= 1, 3000), '通道没有恢复（收不到 pong）')
+    process_.stop('test')
+  } finally {
+    fixture.cleanup()
+  }
+})
+
+test('进程：宿主自己被卡住时，不该把健康的 helper 判死', async () => {
+  const fixture = makeFakeHelper({ readDelayMs: 0 })
+  const warnings = []
+  try {
+    const process_ = new PetProcess({
+      helperPath: fixture.shim,
+      heartbeatMs: 100,
+      heartbeatTimeoutMs: 200,
+      restartDelayMs: 30,
+      env: { FAKE_HELPER_LOG: fixture.log },
+    }, { ...quiet, warn: (message) => warnings.push(String(message)) })
+
+    process_.start()
+    assert.ok(await waitFor(() => process_.isRunning, 5000), '假 helper 未就绪')
+    const pid = process_.pid
+    assert.ok(await waitFor(() => process_.heartbeat.pongs >= 1, 3000), '心跳没起来')
+
+    // 同步占住事件循环 500ms（> 2×interval）：真实世界对应"主线程在跑重活"
+    const until = Date.now() + 500
+    while (Date.now() < until) { /* 忙等，故意的 */ }
+
+    await new Promise((done) => setTimeout(done, 700))
+    assert.equal(process_.pid, pid, 'helper 被误杀了：卡住的是宿主自己')
+    assert.equal(
+      warnings.some((line) => line.includes('心跳超时')),
+      false,
+      `不该报心跳超时：${warnings.join(' / ')}`,
+    )
+    // 恢复之后照常心跳
+    const pongs = process_.heartbeat.pongs
+    assert.ok(await waitFor(() => process_.heartbeat.pongs > pongs, 3000), '卡顿之后心跳没恢复')
+    process_.stop('test')
+  } finally {
+    fixture.cleanup()
+  }
+})
+
+test('进程：每次 ready 都会通知宿主补快照（换 helper 用）', async () => {
+  const fixture = makeFakeHelper({ readDelayMs: 0 })
+  const readyCalls = []
+  try {
+    const process_ = new PetProcess({
+      helperPath: fixture.shim,
+      heartbeatMs: 4000,
+      restartDelayMs: 30,
+      onReady: () => readyCalls.push(Date.now()),
+      env: { FAKE_HELPER_LOG: fixture.log },
+    }, quiet)
+
+    process_.start()
+    assert.ok(await waitFor(() => readyCalls.length === 1, 5000), '首次 ready 没通知宿主')
+    process_.child.kill()
+    assert.ok(
+      await waitFor(() => readyCalls.length === 2, 6000),
+      '重启后没有再次通知宿主：新 helper 会一直空着',
+    )
+    process_.stop('test')
+  } finally {
+    fixture.cleanup()
+  }
+})
+
+/**
+ * 假 helper：只实现协议里被测到的那几条（ready / 读 stdin 落盘 / ping → pong）。
+ *
+ * `readDelayMs` 用来制造"对端不读"的那段时间 —— 背压必须由它逼出来。
+ * 返回的 `shim` 是 PetProcess 能直接 exec 的东西（一个 shell 包装），
+ * 因为真 helper 是可执行文件，而这里只有 node 脚本。
+ */
+function makeFakeHelper({ readDelayMs = 0 } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'pet-fake-helper-'))
+  const script = join(dir, 'fake-helper.mjs')
+  const shim = join(dir, 'fake-helper')
+  const log = join(dir, 'received.jsonl')
+
+  writeFileSync(script, `
+import { appendFileSync } from 'node:fs'
+const out = (payload) => process.stdout.write(JSON.stringify({ v: 1, ...payload }) + '\\n')
+out({ kind: 'ready' })
+process.stdin.setEncoding('utf8')
+let buffer = ''
+setTimeout(() => {
+  process.stdin.on('data', (chunk) => {
+    buffer += chunk
+    let index
+    while ((index = buffer.indexOf('\\n')) >= 0) {
+      const line = buffer.slice(0, index)
+      buffer = buffer.slice(index + 1)
+      if (!line.trim()) continue
+      appendFileSync(process.env.FAKE_HELPER_LOG, line + '\\n')
+      try {
+        if (JSON.parse(line).kind === 'ping') out({ kind: 'pong' })
+      } catch { /* 脏输入忽略 */ }
+    }
+  })
+}, ${Number(readDelayMs)})
+`)
+  writeFileSync(shim, `#!/bin/sh\nexec "${process.execPath}" "${script}"\n`)
+  chmodSync(shim, 0o755)
+
+  return {
+    shim,
+    log,
+    received: () => (existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n').filter(Boolean) : []),
+    // 子进程可能还在写日志（stop 是异步的），删不掉就重试几次，别让清理掩盖断言
+    cleanup: () => rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }),
+  }
+}
 
 test('握手自检：probeHelper 能跑通 ready → pong', { skip: !helperReady }, async () => {
   const result = await probeHelper(defaultHelperPath, { assetRoot: resolve(root, 'assets', 'pack'), timeoutMs: 10000 })
