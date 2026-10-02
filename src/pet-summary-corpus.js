@@ -62,35 +62,45 @@ export function eventsToLines(events) {
 }
 
 /**
+ * 取 digest 里窗口内的文本行（增量模式用；输出与 eventsToLines 逐字一致）。
+ */
+export function digestLines(digest, since) {
+  const lines = []
+  for (const message of digest?.messages ?? []) {
+    if (typeof message?.time !== 'number' || message.time <= since) continue
+    if (!message.text) continue
+    lines.push(message.role === 'user' ? `【用户】${message.text}` : `【助手】${message.text}`)
+  }
+  return lines
+}
+
+/**
  * 全量模式：把今天的会话整理成一段语料。
+ *
+ * 入参是**投影**（`pet-summary-digest.js`），不是原始快照 —— 事件对象在读到的那一刻
+ * 就已经折掉丢弃了（179 个会话全留快照 ≈ 1.3 GB heap，而真正进日报的只有 0.8%）。
  *
  * 每个会话截断到 MAX_CHARS_PER_SESSION，总量再封顶 —— 否则一天几十个会话
  * 会把 prompt 撑爆（超了会直接丢排在后面的会话）。
  */
-export function buildCorpus(records, snapshots, { now = Date.now(), titleOf } = {}) {
+export function buildCorpus(records, digests, { now = Date.now(), titleOf } = {}) {
   const since = startOfToday(now)
   const sessions = []
 
   for (const record of records) {
     if (!countable(record)) continue
     const header = headerOf(record)
-    const snapshot = snapshots.get(header.id)
-    if (!snapshot?.events?.length) continue
+    const digest = digests.get(String(header.id))
+    if (!digest?.messages?.length) continue
 
     const userMessages = []
     const assistantMessages = []
-    let lastTime = header.createdAt ?? 0
-    for (const event of snapshot.events) {
-      if (typeof event?.time === 'number') lastTime = Math.max(lastTime, event.time)
-      if (typeof event?.time !== 'number' || event.time <= since) continue
-      if (event?.type === 'user/message') {
-        if (event?.data?.source?.kind !== 'user') continue
-        const text = eventText(event)
-        if (text) userMessages.push(text)
-      } else if (event?.type === 'assistant/message') {
-        const text = eventText(event)
-        if (text) assistantMessages.push(text)
-      }
+    // 投影已按"今天"切过窗口；这里再兜一次，防的是缓存跨天与单测直接构造 digest
+    let lastTime = Math.max(digest.lastTime ?? 0, header.createdAt ?? 0)
+    for (const message of digest.messages) {
+      if (typeof message?.time !== 'number' || message.time <= since) continue
+      if (message.role === 'user') userMessages.push(message.text)
+      else assistantMessages.push(message.text)
     }
     // 今天动过的会话（按最后事件时间）或者今天创建的
     if (lastTime < since && (header.createdAt ?? 0) < since) continue
@@ -162,24 +172,26 @@ function truncateDelta(lines, budget = MAX_CHARS_PER_SESSION) {
 /**
  * 增量模式：切出每个会话"今天 + 水位之后"的增量。
  *
+ * 入参与 buildCorpus 一样是**投影**（digest），不是原始快照。
+ *
  * @param summarizedUntilOf (sessionId) => number  已总结到的事件时间（0 = 没有留存）
  */
-export function extractDeltas(records, snapshots, { now = Date.now(), summarizedUntilOf } = {}) {
+export function extractDeltas(records, digests, { now = Date.now(), summarizedUntilOf } = {}) {
   const since = startOfToday(now)
   const deltas = []
   for (const record of records) {
     if (!countable(record)) continue
     const header = headerOf(record)
-    const snapshot = snapshots.get(header.id)
-    if (!snapshot?.events?.length) continue
+    const digest = digests.get(String(header.id))
+    if (!digest?.messages?.length) continue
 
     const watermark = Math.max(since, summarizedUntilOf?.(header.id) ?? 0)
-    const fresh = snapshot.events.filter((event) => typeof event?.time === 'number' && event.time > watermark)
-    const lines = eventsToLines(fresh)
+    const lines = digestLines(digest, watermark)
     if (lines.length === 0) continue
 
-    let untilTime = watermark
-    for (const event of fresh) untilTime = Math.max(untilTime, event.time ?? 0)
+    // 水位推进到最后一条**事件**的时间（含工具事件）—— 与旧实现同口径：
+    // 只按消息推进的话，会话里"只动工具没说话"的那一段下轮会被反复重扫。
+    const untilTime = Math.max(watermark, digest.lastTime ?? 0)
     const kept = truncateDelta(lines)
     deltas.push({
       id: header.id,

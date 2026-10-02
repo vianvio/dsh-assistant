@@ -27,9 +27,9 @@ import { appendPart, storePath, summarizedUntil } from './pet-summary-store.js'
  *
  * @returns {Promise<{ markdown: string, sessions: number }>}
  */
-export async function generateTodaySummary(ctx, { logger = console, now = Date.now() } = {}) {
-  const { records, snapshots, titleOf } = await collectSessions(ctx, logger)
-  const { sessions: today, chunks } = buildCorpus(records, snapshots, { now, titleOf })
+export async function generateTodaySummary(ctx, { logger = console, now = Date.now(), digests } = {}) {
+  const { records, digests: scanned, titleOf } = await collectSessions(ctx, logger, { digests })
+  const { sessions: today, chunks } = buildCorpus(records, scanned, { now, titleOf })
   if (today.length === 0) throw new Error('今天还没有可总结的会话')
 
   const date = dateOf(now)
@@ -54,10 +54,10 @@ export async function generateTodaySummary(ctx, { logger = console, now = Date.n
  * @returns {Promise<{ parts: object[], sessions: number, fallbackCwd: string, date: string }>}
  */
 export async function refinePendingParts(ctx, {
-  logger = console, now = Date.now(), storeFile = storePath(), onPart,
+  logger = console, now = Date.now(), storeFile = storePath(), onPart, digests,
 } = {}) {
-  const { records, snapshots, titleOf } = await collectSessions(ctx, logger)
-  const deltas = extractDeltas(records, snapshots, {
+  const { records, digests: scanned, titleOf } = await collectSessions(ctx, logger, { digests })
+  const deltas = extractDeltas(records, scanned, {
     now,
     summarizedUntilOf: (sessionId) => summarizedUntil(sessionId, storeFile),
   })

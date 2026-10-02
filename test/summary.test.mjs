@@ -27,10 +27,21 @@ import {
   summaryRules,
 } from '../src/pet-summary-corpus.js'
 import { collectSessions, runHiddenSession } from '../src/pet-summary-agent.js'
+import { SessionDigests, projectSession } from '../src/pet-summary-digest.js'
 import { generateTodaySummary, generateTodaySummaryStepped, refinePendingParts } from '../src/pet-summary.js'
 import { appendPart, partsFor, readStore, storePath, summarizedUntil, writeStore } from '../src/pet-summary-store.js'
 
 const quiet = { info() {}, warn() {}, error() {}, debug() {} }
+
+/** 把测试里的 `{events}` 快照投影成 digest（窗口 = 今天，与生产同一口径）。 */
+function asDigests(snapshots, now = Date.now()) {
+  const since = startOfToday(now)
+  return new Map([...snapshots].map(([id, snapshot]) => [id, projectSession(snapshot, { since })]))
+}
+
+function digestsOf(events, now = Date.now()) {
+  return projectSession({ events }, { since: startOfToday(now) })
+}
 
 /* ------------------------------------------------------------- 语料 */
 
@@ -56,7 +67,7 @@ test('今日总结：语料只取今天的真人消息，排除子会话与注�
       { type: 'user/message', time: now, data: { source: { kind: 'user' }, content: [{ type: 'text', text: '总结自己' }] } },
     ] }],
   ])
-  const { sessions, chunks } = buildCorpus(records, snapshots, { now, titleOf: (id) => `标题-${id}` })
+  const { sessions, chunks } = buildCorpus(records, asDigests(snapshots, now), { now, titleOf: (id) => `标题-${id}` })
   assert.deepEqual(sessions.map((item) => item.id), ['today'], '只保留今天、非子会话、有用户消息的会话')
   assert.equal(sessions[0].title, '标题-today')
 
@@ -68,7 +79,7 @@ test('今日总结：语料只取今天的真人消息，排除子会话与注�
     { type: 'assistant/message', time: now - 25 * 3600_000, data: { message: { content: [{ type: 'text', text: '做完了' }] } } },
     { type: 'request/header', time: now - 60_000, data: {} },
   ] }]])
-  const empty = buildCorpus(yesterdayOnly, ySnap, { now })
+  const empty = buildCorpus(yesterdayOnly, asDigests(ySnap, now), { now })
   assert.equal(empty.sessions.length, 0, '今天没有真人消息的会话不参与总结')
   assert.equal(empty.chunks.length, 0, '不会把昨天的消息带进来')
 
@@ -94,7 +105,7 @@ test('今日总结：单会话过长时截断，不会把 prompt 撑爆', () => 
     events.push({ type: 'user/message', time: now - 1000, data: { source: { kind: 'user' }, content: [{ type: 'text', text: long }] } })
   }
   const records = [{ header: { id: 'a', createdAt: now, cwd: '/p/a' } }]
-  const { chunks } = buildCorpus(records, new Map([['a', { events }]]), { now })
+  const { chunks } = buildCorpus(records, new Map([['a', digestsOf(events, now)]]), { now })
   assert.ok(chunks[0].includes('已截断'), '超长会话要留截断标记')
   assert.ok(chunks[0].length < 13_000, `实际 ${chunks[0].length}`)
 })
@@ -125,7 +136,7 @@ test('今日总结：增量抽取只取"今天 + 水位之后"的部分', () => 
   ])
 
   // 水位 = 0：今天起的所有内容都要
-  const fresh = extractDeltas(records, snapshots, { now, summarizedUntilOf: () => 0 })
+  const fresh = extractDeltas(records, asDigests(snapshots, now), { now, summarizedUntilOf: () => 0 })
   assert.deepEqual(fresh.map((delta) => delta.id).sort(), ['a', 'b'], '两个会话都有增量')
   const deltaA = fresh.find((delta) => delta.id === 'a')
   assert.ok(deltaA.lines.join('\n').includes('今天新增：改了配置'), '取到今天的增量')
@@ -135,7 +146,7 @@ test('今日总结：增量抽取只取"今天 + 水位之后"的部分', () => 
   assert.ok(!fresh.some((delta) => delta.id === 'quiet'), '今天没更新的会话不参与')
 
   // 水位 = 已总结到 7200_000 之前：只剩助手那句
-  const afterWatermark = extractDeltas(records, snapshots, { now, summarizedUntilOf: (id) => (id === 'a' ? now - 7200_000 : 0) })
+  const afterWatermark = extractDeltas(records, asDigests(snapshots, now), { now, summarizedUntilOf: (id) => (id === 'a' ? now - 7200_000 : 0) })
   const remaining = afterWatermark.find((delta) => delta.id === 'a')
   assert.equal(remaining.lines.join('\n'), '【助手】改好了', '只补水位之后的部分（这就是"只总结没压缩的增量"）')
 })
@@ -330,7 +341,7 @@ test('增量提炼：单会话输入要封顶，且保留最近的部分', () =>
     })
   }
   const records = [{ header: { id: 'a', createdAt: now, cwd: '/p/a' } }]
-  const delta = extractDeltas(records, new Map([['a', { events }]]), { now, summarizedUntilOf: () => 0 })[0]
+  const delta = extractDeltas(records, new Map([['a', digestsOf(events, now)]]), { now, summarizedUntilOf: () => 0 })[0]
 
   assert.ok(delta.chars <= 12_000, `输入要封顶（实际 ${delta.chars} 字符）`)
   assert.ok(delta.dropped > 0, '要报出省略了多少行')
@@ -340,9 +351,98 @@ test('增量提炼：单会话输入要封顶，且保留最近的部分', () =>
 
   // 没超上限时不该动它（别平白加个省略标记）
   const small = extractDeltas([{ header: { id: 'b', createdAt: now, cwd: '/p/b' } }],
-    new Map([['b', { events: [events[39]] }]]), { now, summarizedUntilOf: () => 0 })[0]
+    new Map([['b', digestsOf([events[39]], now)]]), { now, summarizedUntilOf: () => 0 })[0]
   assert.equal(small.dropped, 0)
   assert.ok(!small.lines[0].includes('已省略'))
+})
+
+/* ------------------------------------------------- 投影与扫描缓存（A/B/C） */
+
+test('投影：只留窗口内真人文本，事件对象不进内存，lastTime 按全部事件算', () => {
+  const now = Date.now()
+  const yesterday = now - 30 * 3600_000
+  const digest = projectSession({ events: [
+    { type: 'user/message', time: yesterday, data: { source: { kind: 'user' }, content: [{ type: 'text', text: '昨天' }] } },
+    { type: 'user/message', time: now - 1000, data: { source: { kind: 'user' }, content: [{ type: 'text', text: '今天用户' }] } },
+    { type: 'user/message', time: now - 900, data: { source: { kind: 'hook' }, content: [{ type: 'text', text: '注入' }] } },
+    { type: 'assistant/message', time: now - 800, data: { message: { content: [{ type: 'text', text: '今天助手' }] } } },
+    // 非消息事件：不进 messages，但时间要算进 lastTime（日报排序、水位推进都靠它）
+    { type: 'tool/call', time: now - 100, data: { name: 'bash' } },
+  ] }, { since: startOfToday(now) })
+
+  assert.deepEqual(digest.messages.map((message) => [message.role, message.text]), [
+    ['user', '今天用户'],
+    ['assistant', '今天助手'],
+  ])
+  assert.equal(digest.lastTime, now - 100, 'lastTime 取所有事件的最大时间')
+  assert.equal(digest.events, undefined, '事件对象（几百 MB 的那个）不能挂在 digest 上')
+  assert.ok(!digest.messages.some((message) => message.text === '昨天'), '窗口外的文本不留')
+  assert.ok(!digest.messages.some((message) => message.text === '注入'), '注入的上下文不留')
+})
+
+test('扫描：第二轮只重读"变过"的会话（每次压缩都全量重扫 = 6 秒 CPU 尖峰）', async () => {
+  const now = Date.now()
+  const records = [
+    { header: { id: 'a', createdAt: now, cwd: '/p/a' } },
+    { header: { id: 'b', createdAt: now, cwd: '/p/b' } },
+  ]
+  const event = (text) => ({ type: 'user/message', time: now, data: { source: { kind: 'user' }, content: [{ type: 'text', text }] } })
+  const snapshots = new Map([
+    ['a', { events: [event('a 干活')] }],
+    ['b', { events: [event('b 干活')] }],
+  ])
+  const { ctx, calls } = fakeCtx({ records, snapshots, titles: new Map() })
+  const digests = new SessionDigests()
+
+  const first = await collectSessions(ctx, quiet, { digests })
+  assert.deepEqual(calls.readSession, ['a', 'b'], '第一轮没缓存，两个都要读')
+  assert.ok(first.digests.get('a').messages.length > 0, '投影进了缓存')
+
+  const second = await collectSessions(ctx, quiet, { digests })
+  assert.deepEqual(calls.readSession, ['a', 'b'], '第二轮一个都不重读')
+  assert.equal(second.digests.get('a').messages[0].text, 'a 干活')
+
+  // 只有变了的那一个会话要重读
+  digests.touch('b')
+  await collectSessions(ctx, quiet, { digests })
+  assert.deepEqual(calls.readSession, ['a', 'b', 'b'], '只有 b 变了，就只重读 b')
+})
+
+test('扫描：跨天作废缓存（投影窗口是"今天"，昨天的 digest 不能用）', async () => {
+  const now = Date.now()
+  let clock = now
+  const records = [{ header: { id: 'a', createdAt: now, cwd: '/p/a' } }]
+  const snapshots = new Map([['a', { events: [
+    { type: 'user/message', time: now, data: { source: { kind: 'user' }, content: [{ type: 'text', text: '干活' }] } },
+  ] }]])
+  const { ctx, calls } = fakeCtx({ records, snapshots, titles: new Map() })
+  const digests = new SessionDigests({ now: () => clock })
+
+  await collectSessions(ctx, quiet, { digests })
+  await collectSessions(ctx, quiet, { digests })
+  assert.equal(calls.readSession.length, 1, '同一天内不重读')
+
+  clock = now + 26 * 3600_000     // 第二天
+  digests.touch('a')
+  const tomorrow = await collectSessions(ctx, quiet, { digests })
+  assert.equal(calls.readSession.length, 2, '跨天必须重读：昨天的投影里没有今天的文本')
+  assert.equal(tomorrow.digests.get('a').messages.length, 0, '昨天的事件不算今天的增量')
+})
+
+test('扫描：每个会话之间把事件循环让出去（否则宿主心跳被整体推迟）', async () => {
+  const now = Date.now()
+  const records = Array.from({ length: 5 }, (_, index) => ({ header: { id: `s${index}`, createdAt: now, cwd: `/p/${index}` } }))
+  const snapshots = new Map(records.map((record, index) => [
+    record.header.id,
+    { events: [{ type: 'user/message', time: now, data: { source: { kind: 'user' }, content: [{ type: 'text', text: `第 ${index} 个` }] } }] },
+  ]))
+  const { ctx } = fakeCtx({ records, snapshots, titles: new Map() })
+
+  let yielded = 0
+  const ticker = setInterval(() => { yielded += 1 }, 0)
+  await collectSessions(ctx, quiet, { digests: new SessionDigests() })
+  clearInterval(ticker)
+  assert.ok(yielded > 0, '扫描期间别的时间源必须能跑（这里靠 setImmediate 让出）')
 })
 
 /* ------------------------------------------------------- 水位存储 */
@@ -452,7 +552,7 @@ test('执行层：读不出来的会话跳过，退回 surface', async () => {
     ['fine', { events: [{ type: 'user/message', time: now, data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'fine' }] } }] }],
   ])
   const { ctx, calls } = fakeCtx({ records, snapshots, titles: new Map() })
-  const { snapshots: loaded } = await collectSessions(ctx, quiet)
+  const { digests: loaded } = await collectSessions(ctx, quiet)
   assert.deepEqual(calls.readSurface, ['broken'], '整段读不出来才退回 surface')
   assert.ok(loaded.has('fine'))
   assert.ok(loaded.has('broken'))

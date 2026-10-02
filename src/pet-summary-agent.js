@@ -18,52 +18,91 @@
 
 import { randomUUID } from 'node:crypto'
 
+import { createSessionDigests, projectSession } from './pet-summary-digest.js'
+
 const TIMEOUT_MS = 5 * 60 * 1000
 
 /**
- * 取所有会话的当前快照。读不出来的会话按"跳过"处理 ——
+ * 取所有会话的当前投影。读不出来的会话按"跳过"处理 ——
  * 部分会话（fork/seeded 的、历史格式有瑕疵的）整段复现会失败，
  * 别让一整天都总结不出来。
+ *
+ * 三个关键点（都是实测出来的，别改回去）：
+ *
+ *  1. **投影**：读到快照立刻折成 digest（`pet-summary-digest.js`），事件对象当场丢弃。
+ *     旧实现把 179 个会话的快照全留在 Map 里 —— 1.09 GB 解压内容 ≈ 1.3 GB heap，
+ *     而真正进日报的只有 0.8%。
+ *
+ *  2. **缓存 + 脏标记**：只重读"没缓存过"或"宿主标脏过"的会话（`digests.takeDirty()`）。
+ *     全量重扫只在启动后第一轮发生一次；之后每轮退化到个位数会话 ——
+ *     后台总结是**每次会话压缩**都会跑的，这一条决定了它是不是常态尖峰。
+ *
+ *  3. **让出主线程**：整段读会话是同步 CPU（解压 + JSON.parse + surface 折叠），
+ *     串行 179 个会把宿主的 15 秒心跳窗口吃掉。每个会话之间 `setImmediate` 一次，
+ *     事件循环就不会被连续占住。
  */
-export async function collectSessions(ctx, logger = console) {
+export async function collectSessions(ctx, logger = console, { digests } = {}) {
   const sessionQuery = ctx?.get?.('sessionQuery')
   const agents = ctx?.get?.('agents')
   if (!sessionQuery || !agents) {
     throw new Error('当前 DSH 缺少 sessionQuery / agents 服务，无法生成总结')
   }
 
+  // 没有传缓存就每轮新建一份（等价于旧行为：每次都全读）—— 测试与一次性调用走这条
+  const cache = digests ?? createSessionDigests()
+  // 扫描**开始**就取走脏集：扫描期间新到的事件留给下一轮（这一轮的摘要已经不含它们）
+  const pending = cache.takeDirty()
+  const since = cache.windowStart
   const records = await sessionQuery.listSessions()
-  const snapshots = new Map()
   const ids = []
+  const usable = []
+
   for (const record of records) {
     const header = record?.header ?? record
     if (!header?.id || header.origin === 'subagent') continue
-    ids.push(String(header.id))
+    const id = String(header.id)
+    ids.push(id)
+    if (cache.has(id) && !pending.has(id)) {
+      if (cache.get(id).messages.length > 0) usable.push(id)
+      continue
+    }
+    cache.reads += 1
     try {
-      snapshots.set(header.id, await sessionQuery.readSession(header.id))
+      const snapshot = await sessionQuery.readSession(id)
+      const digest = projectSession(snapshot, { since })
+      cache.put(id, digest)
+      if (digest.messages.length > 0) usable.push(id)
     } catch (error) {
       const reason = message(error)
       // 整段复现失败时退一步读"当前 surface"：它只取需要的那部分事件，宽容得多
+      let recovered = false
       try {
-        const surface = await sessionQuery.readSurface?.(header.id)
+        const surface = await sessionQuery.readSurface?.(id)
         if (surface?.events?.length) {
-          snapshots.set(header.id, surface)
-          logger.warn?.(`dsh-assistant: 会话 ${header.id} 整段读取失败，已退回 surface（${reason.slice(0, 60)}）`)
-          continue
+          const digest = projectSession(surface, { since })
+          cache.put(id, digest)
+          if (digest.messages.length > 0) usable.push(id)
+          logger.warn?.(`dsh-assistant: 会话 ${id} 整段读取失败，已退回 surface（${reason.slice(0, 60)}）`)
+          recovered = true
         }
       } catch {
         // 读不出来就跳过这一个会话
       }
-      logger.warn?.(`dsh-assistant: 跳过会话 ${header.id}: ${reason}`)
+      if (!recovered) logger.warn?.(`dsh-assistant: 跳过会话 ${id}: ${reason}`)
+    } finally {
+      // 让出主线程：否则连读几十个会话时，宿主的定时器/心跳会被整体推迟
+      await yieldToLoop()
     }
   }
 
-  // 标题是**异步**的：`readTitle()` 返回 Promise<SessionTitleSnapshot|undefined>。
-  // 这里曾经漏了 await，把 `.title` 取在 Promise 上 → 永远是 undefined，
-  // 于是报告里每个会话的标题都退化成 cwd。改成批量读一次（一次语料投影
-  // 里折出全部标题），读不到再退回逐个 await。
-  const titles = await readTitles(sessionQuery, ids, logger)
-  return { records, snapshots, titleOf: (id) => titles.get(String(id)) }
+  // 标题只对"真有今天内容的会话"读：标题是锦上添花，没必要为 179 个会话各折一次语料
+  const titles = await readTitles(sessionQuery, usable, logger)
+  return { records, digests: cache, titleOf: (id) => titles.get(String(id)) }
+}
+
+/** 把主线程让出去一轮（见 collectSessions 的第 3 条）。 */
+function yieldToLoop() {
+  return new Promise((resolve) => setImmediate(resolve))
 }
 
 /** 一次读回所有会话标题；失败不致命（标题只是锦上添花）。 */

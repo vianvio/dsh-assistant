@@ -15,6 +15,7 @@ import { PetReducer } from './pet-reducer.js'
 import { sessionId } from './events.js'
 import { INTERACTIONS, createPatTracker, interactionMessage, zoneToAction } from './pet-interactions.js'
 import { generateTodaySummary, generateTodaySummaryStepped, refinePendingParts } from './pet-summary.js'
+import { createSessionDigests } from './pet-summary-digest.js'
 import { reportLengthWarning } from './pet-summary-corpus.js'
 import { PetMessageKind, PetState, createMessage } from './protocol.js'
 import { BUBBLE_THEMES, clampScale } from './pet-settings.js'
@@ -35,6 +36,14 @@ export function mountPet({ ctx, settings, eventCtx, logger = console, tuning = {
 
   let process
   let reducer
+  /**
+   * 会话投影的缓存（「今天干了什么」那一层的扫描账本）。
+   *
+   * 每个会话一份 digest + 一个脏标记：只有"这一轮变过的会话"才重读。
+   * 后台总结是**每次会话压缩**都会跑的，没有这一层就是每轮全量重扫 ——
+   * 实测 179 个会话、1.09 GB 解压内容、83 万条事件，而真正进日报的只有 0.8%。
+   */
+  const digests = createSessionDigests()
   /**
    * 这一次 ready 是不是"进程刚起来的那一次"。
    *
@@ -241,9 +250,10 @@ export function mountPet({ ctx, settings, eventCtx, logger = console, tuning = {
       const { markdown, sessions } = stepped
         ? await generateTodaySummaryStepped(ctx, {
           logger,
+          digests,
           onPart: ({ index, total, title }) => progress(`正在整理今天的对话…（${index}/${total}）`, title),
         })
-        : await generateTodaySummary(ctx, { logger })
+        : await generateTodaySummary(ctx, { logger, digests })
 
       // 提示词是软约束，写长了要能看见（否则只能靠肉眼发现日报越来越长）
       const warning = reportLengthWarning(markdown)
@@ -305,7 +315,7 @@ export function mountPet({ ctx, settings, eventCtx, logger = console, tuning = {
     }
     backgroundBusy = true
     try {
-      const result = await refinePendingParts(ctx, { logger })
+      const result = await refinePendingParts(ctx, { logger, digests })
       logger.info?.(
         `dsh-assistant: 压缩后已后台总结并留存（触发 ${event?.type ?? '?'}，补 ${result.parts.length} 段）`,
       )
@@ -319,6 +329,8 @@ export function mountPet({ ctx, settings, eventCtx, logger = console, tuning = {
   // 事件订阅：用未限定作用域的 root 总线，显式随插件生命周期释放
   const bus = eventCtx ?? ctx?.root ?? ctx
   const offEvent = bus?.on?.('session/event', (session, event) => {
+    // 这个会话今天有新内容了 —— 下一轮总结要重读它（缓存靠这一句才敢跳读）
+    digests.touch(sessionId(session))
     // 后台总结与宠物状态无关：helper 缺失时也要能攒（它服务的是"今天干了什么"）
     if (event?.type === 'compaction/end') void backgroundSummarise(session, event)
     if (!process || !reducer) return
