@@ -51,8 +51,31 @@ final class PetController: NSObject {
 
     // MARK: - 循环
 
+    /// tick 的最短间隔。
+    ///
+    /// 内核可能报出 0 或 1（事件刚好到期），不设下限就会退化成忙循环。
+    /// 8ms 远小于素材的最小帧间隔（manifest 里 frameMs 被夹到 >= 16），
+    /// 所以正常运行下这个地板永远不会生效。
+    private static let minTickMs = 8
+    /// 完全没有待办事件时的巡检间隔。
+    ///
+    /// 1Hz 的唤醒成本约等于零，换来的是不必为"将来可能发生的每一种变化"各排一个定时器：
+    /// 所有状态变更都会走 `apply(_:)`，那里会立刻重排 tick。
+    private static let idleTickSeconds: TimeInterval = 1
+
     private var tickTimer: Timer?
     private var lastTickAt = CACurrentMediaTime()
+    /// 会话不可见（锁屏 / 息屏 / 切换用户）
+    private var sessionInactive = false
+    /// 循环是否已停摆。停摆时不持有任何定时器。
+    private var suspended = false
+    private var workspaceObservers: [NSObjectProtocol] = []
+    /// 我们自己把窗口收起来了（菜单「本次隐藏」/ 宿主 hide 命令）。
+    ///
+    /// 单独记一个标志，而不是去问 `panel.isVisible`：start() 里那次 orderFront
+    /// 发生在 NSApp.run() 之前，那时 isVisible 还不一定翻了 true ——
+    /// 按它判定会把循环永久停住。
+    private var hiddenByRequest = false
 
     // MARK: - 文案与总结
 
@@ -60,6 +83,10 @@ final class PetController: NSObject {
     /// 原生读 selfName），于是它一直停在默认值。
     private var selfName = "宠物"
     private var bubbleMessage: String?
+    /// 气泡第二行。**必须和 bubbleMessage 一起做快照**：窗口高度是按它们实测出来的，
+    /// 只更新 message 会让高度停在旧值（测量与绘制同源，见 PetMetrics 的说明）。
+    private var bubbleDetail: String?
+    /// 上一次真正画出去的气泡签名（文案 + 明细）
     private var lastDrawnBubble: String?
     /// 「今天干了什么」的正文（本地持有，点通知/菜单打开弹窗）
     private var summaryTitle = "今天干了什么"
@@ -69,6 +96,10 @@ final class PetController: NSObject {
     private var lastDrawnClip: String?
     private var lastDrawnFrame: String?
     private var needsFullRedraw = true
+    /// 气泡实测尺寸的记忆化槽（见 measuredBubbleSize()）
+    private var cachedBubbleSize: (key: String, size: NSSize)?
+    /// 上一次重排窗口时的通知条数（用来发现"兜底过期"这种自己发生的变化）
+    private var lastNoticeCount = 0
 
     init(manifest: PetManifest, root: URL, layout: PetLayoutStore, channel: PetOutbound = StdoutChannel()) {
         self.manifest = manifest
@@ -108,6 +139,10 @@ final class PetController: NSObject {
         // 素材解析、建窗、首帧解码，能差出几百毫秒甚至几秒 ——
         // 那段时间会被当成"已经过去"，第一帧直接跳格、通知也可能被瞬间判过期。
         lastTickAt = CACurrentMediaTime()
+        observeSessionVisibility()
+        refreshSuspension()
+        // 首帧也要交给图层：它不走 draw(_:)，所以没有"第一次重绘"能顺带把它画出来
+        refreshPetLayer()
         scheduleTick()
         emit(["kind": "ready"])
     }
@@ -115,23 +150,85 @@ final class PetController: NSObject {
     func stop(reason: String) {
         tickTimer?.invalidate()
         tickTimer = nil
+        for observer in workspaceObservers {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+        }
+        workspaceObservers.removeAll()
         window?.close()
         window = nil
         emit(["kind": "closed", "reason": reason])
     }
 
+    // MARK: - 停摆（看不见的时候不烧 CPU）
+
+    /// 锁屏 / 息屏 / 切换用户时整个循环停掉。
+    ///
+    /// 桌面宠物最常见的状态就是"没人在看它"，而旧实现无论看不看得见都满速跑。
+    /// 停在 `NSWorkspace` 的会话通知上（而不是轮询）—— 这些事件本来就由系统广播。
+    private func observeSessionVisibility() {
+        let center = NSWorkspace.shared.notificationCenter
+        let asleep: [Notification.Name] = [
+            NSWorkspace.sessionDidResignActiveNotification,
+            NSWorkspace.screensDidSleepNotification,
+        ]
+        let awake: [Notification.Name] = [
+            NSWorkspace.sessionDidBecomeActiveNotification,
+            NSWorkspace.screensDidWakeNotification,
+        ]
+        for name in asleep {
+            workspaceObservers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                self?.sessionInactive = true
+                self?.refreshSuspension()
+            })
+        }
+        for name in awake {
+            workspaceObservers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                self?.sessionInactive = false
+                self?.refreshSuspension()
+            })
+        }
+    }
+
+    /// 重新判定该不该跑。
+    ///
+    /// 刻意**不**去问 AppKit "窗口可见吗"：`start()` 里那次 `orderFrontRegardless()`
+    /// 发生在 `NSApp.run()` 之前，那一刻 `isVisible` 还不一定是 true ——
+    /// 按它判定会把循环永久停住，宠物再也不动。窗口是不是在屏上，只有 AppKit 说了算，
+    /// 而它没有"已上屏/已下屏"的通知（`NSWindowDidOrderOnScreenNotification` 在
+    /// AppKit 里并不存在），所以这里只认两件我们自己确定的事：
+    ///   ① 会话不可见（锁屏 / 息屏）；② 我们自己把窗口收起来了。
+    private func refreshSuspension() {
+        setSuspended(sessionInactive || hiddenByRequest)
+    }
+
+    private func setSuspended(_ value: Bool) {
+        guard suspended != value else { return }
+        suspended = value
+        if value {
+            tickTimer?.invalidate()
+            tickTimer = nil
+        } else {
+            // 别把停摆的这段时间当成"已经过去"：否则一恢复就跳帧，通知还会被瞬间判过期
+            //（与 start() 里首次取基准时间是同一个理由）
+            lastTickAt = CACurrentMediaTime()
+            scheduleTick()
+        }
+    }
+
     // MARK: - 心跳循环
 
-    /// 按当前片段的帧节奏安排下一次 tick（换片段时会重排）。
+    /// 排**一次** tick。
     ///
-    /// 间隔跟着片段走：
-    ///   · 静图段：250ms 一次（只处理到期 / IDLE 换图），几乎不耗电；
-    ///   · 序列帧段：帧间隔的一半（如 30ms/帧 → 15ms 一次），
-    ///     否则 250ms 的粗粒度会把 30ms 的帧一格一格吃掉，看起来更顿。
-    private func scheduleTick() {
+    /// 旧实现是固定重复定时器，间隔取帧间隔的一半（30ms/帧 → 每 15ms 一次，
+    /// 每秒 66 次），其中一半以上的唤醒什么都没做，静图段也每秒白醒四次。
+    /// 现在只在"内核说的下一个事件到点"时醒一次：序列帧段 = 1× 帧率，静图段 = 真有事件才醒。
+    ///
+    /// `fireNow` 给协议消息用：消息刚到、画面可能变了，早看一眼别等到下一个帧边界。
+    private func scheduleTick(fireNow: Bool = false) {
+        guard !suspended else { return }
         tickTimer?.invalidate()
-        let interval = tickInterval(for: animation.currentClip)
-        let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
+        let interval = fireNow ? 0 : nextTickInterval()
+        let timer = Timer(timeInterval: interval, repeats: false) { [weak self] _ in
             self?.tick()
         }
         // .common 模式：拖动窗口 / 打开菜单时 run loop 切到事件跟踪模式，
@@ -140,50 +237,71 @@ final class PetController: NSObject {
         tickTimer = timer
     }
 
-    private func tickInterval(for clip: PetManifest.Clip?) -> TimeInterval {
-        guard clip?.isAnimated == true else { return 0.25 }
-        return max(0.008, Double(clip?.frameMs ?? 90) / 2000.0)
+    private func nextTickInterval() -> TimeInterval {
+        guard let dueMs = animation.nextEventMs() else { return Self.idleTickSeconds }
+        return max(Double(Self.minTickMs) / 1000, Double(dueMs) / 1000)
     }
 
     private func tick() {
+        tickTimer?.invalidate()
+        tickTimer = nil
+        guard !suspended else { return }
+
         let now = CACurrentMediaTime()
-        let elapsedMs = Int((now - lastTickAt) * 1000)
+        // 四舍五入而不是截断：一次性定时器正好卡在帧边界上时，
+        // 截断会把不到 1ms 的差额算成"还差 1ms 不够翻帧"，于是白醒一次再排一次。
+        let elapsedMs = Int(((now - lastTickAt) * 1000).rounded())
         lastTickAt = now
-        let dirty = animation.advance(elapsedMs: elapsedMs)
+        // 返回值（"画面变了"）不再用来决定重绘：换帧走图层、状态变化走下面的
+        // 片段/通知/气泡三处判断，各自都能独立说清自己为什么需要重绘。
+        animation.advance(elapsedMs: elapsedMs)
         // 自己找点事做：状态维持够久、骰子也中了 —— 当成一次"用户点了互动"发给宿主。
         // 台词与时长照旧由宿主决定（原生端只报动作），所以宿主那半不用改任何东西。
         // 窗口收起来时不发：对着一个看不见的宠物演戏没有意义。
         if let auto = animation.takeAutoInteraction(), window?.panel.isVisible == true {
             emit(["kind": "interaction", "source": "auto", "action": auto])
         }
+        var petChanged = false
         if let clip = animation.currentClip, clip.file != lastDrawnClip {
             lastDrawnClip = clip.file
             resizeForCurrentClip()
-            needsFullRedraw = true
-            if tickIntervalIsStale(for: clip) { scheduleTick() }
+            petChanged = true
         }
         if let currentFile = animation.currentFrame?.file, currentFile != lastDrawnFrame {
             lastDrawnFrame = currentFile
             frames.prefetch(currentFile)
             if let next = animation.nextFrameFile { frames.prefetch(next) }
-            needsFullRedraw = true
+            petChanged = true
         }
+        // 换帧只动图层内容，不碰 view.needsDisplay —— 这正是省下那几毫秒的地方
+        if petChanged { refreshPetLayer() }
         refreshBubble()
-        // 只有换图 / 窗口变化 / 文案变化时才重绘，其余时间不重绘（省电）。
+        // 通知条数变了（新增 / 被点掉 / 兜底过期）→ 窗口要向上长或缩，并且重绘。
+        // 兜底过期走的是 advance()，原来这条路径从不重排窗口，通知带会一直占着高度。
+        if animation.notices.count != lastNoticeCount {
+            resizeWindow()
+        }
+        // 只有气泡/通知/窗口变化时才重绘（宠物本体已经交给图层了）。
         // lastDrawnBubble 在这里收敛：文案变了就重绘一次并记下，下一 tick 条件即为假
         //（之前 refreshBubble 把旧值记进 lastDrawnBubble，导致这个条件**永远为真**，
         //  每个 tick 都在强制重绘）。
-        if dirty || needsFullRedraw || bubbleMessage != lastDrawnBubble {
+        if needsFullRedraw || bubbleSignature != lastDrawnBubble {
             needsFullRedraw = false
-            lastDrawnBubble = bubbleMessage
+            lastDrawnBubble = bubbleSignature
             view.needsDisplay = true
         }
+        // 一次性定时器：每次醒完重新按"下一个事件"排下一次。
+        // 换片段不再需要单独重排（旧实现要靠 tickIntervalIsStale 判断）。
+        scheduleTick()
     }
 
-    /// 当前 tick 间隔是否与片段的帧节奏不匹配（换片段后需要重排）。
-    private func tickIntervalIsStale(for clip: PetManifest.Clip) -> Bool {
-        guard let timer = tickTimer else { return true }
-        return abs(timer.timeInterval - tickInterval(for: clip)) > 0.001
+    /// 气泡的签名：文案或明细任何一个变了，实测高度都会变 → 必须重排窗口并重绘。
+    ///
+    /// 旧实现只比 `bubbleMessage`，明细单独变化时窗口高度停在旧值 ——
+    /// 第二行会被挤掉，或者底下多留一截空白。
+    private var bubbleSignature: String? {
+        guard let message = bubbleMessage, !message.isEmpty else { return nil }
+        return message + "\u{1}" + (bubbleDetail ?? "")
     }
 
     // MARK: - 窗口与位置
@@ -193,7 +311,9 @@ final class PetController: NSObject {
             clip: animation.currentClip,
             canvas: canvasSize,
             message: bubbleMessage,
-            detail: animation.bubbleDetail
+            // 用本地快照而不是 animation.bubbleDetail：窗口是按这个值量出来的，
+            // 绘制也必须读同一个值，否则测量与绘制会漂移。
+            detail: bubbleDetail
         )
     }
 
@@ -209,6 +329,8 @@ final class PetController: NSObject {
         petY = Double(bottomY)
         window.setFrame(origin: NSPoint(x: originX, y: bottomY), size: size)
         view.frame = NSRect(origin: .zero, size: size)
+        // 视图尺寸变了 → 角色矩形也变了 → 图层要跟着挪
+        refreshPetLayer()
     }
 
     /// 位置重排（气泡文案变化 / 通知增减时用）。
@@ -218,7 +340,9 @@ final class PetController: NSObject {
         petY = Double(clampY(CGFloat(petY), height: size.height))
         window?.setFrame(origin: NSPoint(x: petX, y: petY), size: size)
         view.frame = NSRect(origin: .zero, size: size)
+        lastNoticeCount = animation.notices.count
         needsFullRedraw = true
+        refreshPetLayer()
     }
 
     /// 把 x 夹进"宠物完整可见"的范围。屏幕比窗口还窄时退回屏幕左边缘，
@@ -258,6 +382,8 @@ final class PetController: NSObject {
     /// 已经隐藏时也把窗口放回来 —— 否则「藏起来」就成了单向操作。
     private func resetToHomePosition() {
         window?.show()
+        hiddenByRequest = false
+        refreshSuspension()
         guard let screen = currentScreen() else { return }
         let visible = screen.visibleFrame
         let size = windowSize()
@@ -272,7 +398,12 @@ final class PetController: NSObject {
     }
 
     private func hidePet() {
-        window?.panel.orderOut(nil)
+        // 走 PetWindow.hide()：它会记下"用户主动藏的"，否则 keepFrontTimer
+        // 两秒后就把窗口又顶上来了（「本次隐藏」等于没藏）。
+        window?.hide()
+        hiddenByRequest = true
+        // 藏起来之后整个循环停摆 —— 旧实现仍然满速给一个没人看的窗口逐帧重绘。
+        refreshSuspension()
     }
 
     /**
@@ -315,9 +446,13 @@ final class PetController: NSObject {
     }
 
     private func refreshBubble() {
-        let next = bubbleEnabled ? animation.bubbleMessage : nil
-        guard next != bubbleMessage else { return }
-        bubbleMessage = next
+        let nextMessage = bubbleEnabled ? animation.bubbleMessage : nil
+        let nextDetail = bubbleEnabled ? animation.bubbleDetail : nil
+        // 明细也算"文案"：它变了，气泡实测高度就变，窗口必须跟着重排。
+        // （旧版只比 message，明细单独变化时窗口高度会停在旧值 —— 第二行被压掉或留白。）
+        guard nextMessage != bubbleMessage || nextDetail != bubbleDetail else { return }
+        bubbleMessage = nextMessage
+        bubbleDetail = nextDetail
         // 文案变了 → 气泡实测高度会变 → 窗口必须重排。
         // 漏这一步的症状：刚打开时窗口还是"没有气泡"的高度，气泡被压扁成一条
         // （绘制时会被 clamp 到 24pt），要等下一次换片段才恢复。
@@ -378,7 +513,11 @@ final class PetController: NSObject {
         default:
             break
         }
-        view.needsDisplay = true
+        // 不在这里无条件 `view.needsDisplay = true`：那样连 ping/pong、hello、
+        // summary 回执都要走一次整窗重绘，而它们一个像素都没改。
+        // 画面到底变没变由 tick 里那一处判断统一收口（片段 / 帧 / 气泡签名 + needsFullRedraw），
+        // 这里只负责"别等到下一个帧边界才看一眼"。
+        scheduleTick(fireNow: true)
     }
 
     private func applyConfig(_ message: [String: Any]) {
@@ -498,6 +637,10 @@ final class PetController: NSObject {
             "dwellMs": animation.dwellMs,
             "windowWidth": Double(size.width),
             "windowHeight": Double(size.height),
+            // 角色/气泡各自的实际矩形：排查"宠物画歪了""气泡和角色对不上"用
+            //（视图坐标是 flipped，y 越小越靠上）
+            "petRect": NSStringFromRect(petRect()),
+            "noticeCountShown": lastNoticeCount,
             "screenCount": NSScreen.screens.count,
             "visibleFrame": screen.map { NSStringFromRect($0.visibleFrame) } ?? "nil",
         ]
@@ -695,36 +838,57 @@ final class PetController: NSObject {
         return metrics.petRect(
             bounds: view.bounds,
             clip: animation.currentClip,
-            bubbleHeight: metrics.bubbleSize(
-                message: bubbleMessage,
-                detail: animation.bubbleDetail,
-                outerWidth: view.bounds.width
-            ).height
+            bubbleHeight: measuredBubbleSize().height
         )
     }
 
+    /// 气泡实测尺寸（带记忆化）。
+    ///
+    /// 每次重绘原本要跑 2~3 遍 CoreText 测量：`petRect()`（算角色矩形要用气泡高度）、
+    /// `drawBubble()`、以及重排时的 `windowSize()` 各一遍。它在同一份文案 + 同一个宽度下
+    /// 是确定值，所以按"会改变它的那几个输入"记一次就够。
+    private func measuredBubbleSize() -> NSSize {
+        let metrics = self.metrics
+        let outerWidth = view.bounds.width
+        let key = "\(bubbleSignature ?? "")|\(outerWidth)|\(metrics.bubbleScale)|\(metrics.bubbleEnabled)"
+        if let cached = cachedBubbleSize, cached.key == key { return cached.size }
+        let size = metrics.bubbleSize(message: bubbleMessage, detail: bubbleDetail, outerWidth: outerWidth)
+        cachedBubbleSize = (key: key, size: size)
+        return size
+    }
+
+    /// 只画气泡与通知。
+    ///
+    /// 宠物本体不在这里 —— 它是 `view.updatePet()` 交给图层内容的位图。
+    /// 于是这条路径只在文案/通知真的变化时走，不再随每一帧跑一遍整窗重绘。
     func draw(in view: NSView) {
         guard let context = NSGraphicsContext.current?.cgContext else { return }
         context.clear(view.bounds)
 
-        guard let frame = animation.currentFrame,
-              let image = frames.image(for: frame.file) else { return }
-
+        // 气泡贴「这张图的头顶」而不是窗口顶。
+        // 用 clip 的素材像素高算比例（原来是问 NSImage.size），与 petRect 同源。
         let rect = petRect()
-        context.saveGState()
-        // 本视图是 flipped（y 向下）；NSImage 直接画会被上下颠倒，
-        // 所以先把这个矩形内的坐标系翻回 AppKit 常规方向（y 向上）。
-        context.translateBy(x: 0, y: rect.maxY + rect.minY)
-        context.scaleBy(x: 1, y: -1)
-        image.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1)
-        context.restoreGState()
-
-        // 气泡贴「这张图的头顶」而不是窗口顶
-        let scaleFactor = image.size.height > 0 ? rect.height / image.size.height : 1
-        drawBubble(above: rect.minY + frame.top * scaleFactor)
+        let scaleFactor = clipPixelHeight() > 0 ? rect.height / clipPixelHeight() : 1
+        let top = animation.currentFrame?.top ?? 0
+        drawBubble(above: rect.minY + top * scaleFactor)
 
         // 完成通知单独画在最上方 —— 与状态气泡互不干扰
         drawNotices()
+    }
+
+    /// 把当前帧交给图层内容（换帧不再触发重绘）。
+    private func refreshPetLayer() {
+        guard let frame = animation.currentFrame else {
+            view.updatePet(nil, in: .zero)
+            return
+        }
+        view.updatePet(frames.cgImage(for: frame.file), in: petRect())
+    }
+
+    /// 当前素材的像素高（气泡定位要用；没有素材时退回 1 免得除零）。
+    private func clipPixelHeight() -> CGFloat {
+        let height = animation.currentClip?.height ?? 0
+        return height > 0 ? height : 1
     }
 
     /// 双行气泡：第一行是当前动作/并行摘要，第二行是项目与各项目状态。
@@ -736,9 +900,9 @@ final class PetController: NSObject {
         let message = bubbleMessage
         guard metrics.bubbleEnabled, let message, !message.isEmpty else { return }
 
-        let detail = animation.bubbleDetail
+        let detail = bubbleDetail
         let outerWidth = view.bounds.width
-        let size = metrics.bubbleSize(message: message, detail: detail, outerWidth: outerWidth)
+        let size = measuredBubbleSize()
         let rect = metrics.bubbleRect(size: size, outerWidth: outerWidth, characterTop: characterTop)
         let palette = metrics.theme.palette
         let titleAttributes: [NSAttributedString.Key: Any] = [.font: metrics.titleFont, .foregroundColor: palette.title]

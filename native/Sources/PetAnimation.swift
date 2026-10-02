@@ -266,6 +266,49 @@ final class PetAnimation {
         return dirty
     }
 
+    /// 距离「画面下一次真的会变」还有多少毫秒；没有任何待办事件时返回 nil。
+    ///
+    /// 这是**省电的核心**：调用方据此安排一次性的唤醒，而不是按固定间隔反复醒。
+    /// 旧实现按帧间隔的一半固定重复唤醒（30ms/帧 → 每 15ms 一次，每秒 66 次），
+    /// 其中一半以上醒来什么都没做；静图段更是一秒白醒四次。
+    ///
+    /// 口径与 `advance(elapsedMs:)` 严格一致 —— 帧播放、浮层/脉冲到期、通知过期、
+    /// IDLE 换图、自动互动全部用同一套模拟时钟 / 模拟累计量，
+    /// 所以这里算出来的时刻一定能在对应那一次 `advance` 里被兑现（不会排个永远不发生的唤醒）。
+    func nextEventMs() -> Int? {
+        var candidates: [Int] = []
+
+        // 1) 序列帧：下一格什么时候该翻。
+        //    非循环 clip 播到最后一格之后就再也没有帧事件了 —— 排进去会变成空转。
+        if let clip = currentClip, clip.isAnimated, clip.frameMs > 0,
+           clip.loop || frameIndex + 1 < clip.frames.count {
+            candidates.append(clip.frameMs - frameElapsedMs)
+        }
+
+        // 2) 浮层 / 脉冲的 ttl：到点回落到状态底图
+        if let overlay { candidates.append(overlay.deadlineMs - clockMs) }
+        if let pulse { candidates.append(pulse.deadlineMs - clockMs) }
+
+        // 3) 通知的兜底过期：**最老的那条**先到点（年龄最大 = 剩余最少）
+        if noticeTtlMs > 0, !notices.isEmpty {
+            let oldestAge = notices.map { noticeAgeMs[$0.id] ?? 0 }.max() ?? 0
+            candidates.append(noticeTtlMs - oldestAge)
+        }
+
+        // 4) IDLE 定期换图：只有没被浮层/脉冲压着的时候才在累计
+        if overlay == nil, pulse == nil, state == .idle, idleRotateMs > 0 {
+            candidates.append(idleRotateMs - rotateAccumulatorMs)
+        }
+
+        // 5) 自动互动的掷骰子时刻
+        if autoInteractMs > 0, pendingAutoInteraction == nil {
+            candidates.append(autoInteractMs - dwellMs)
+        }
+
+        // 取最近的一个；负数（已经到期还没被处理）收敛到 0，表示"立刻就该醒"
+        return candidates.map { max(0, $0) }.min()
+    }
+
     // MARK: - 输出
 
     var currentClip: PetManifest.Clip? { manifest.clip(clipName) }

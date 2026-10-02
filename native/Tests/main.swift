@@ -55,6 +55,14 @@ func makeManifest() throws -> (manifest: PetManifest, root: URL) {
                 "dir": "idle/idle-motion", "prefix": "idle-motion",
                 "count": 4, "frameMs": 50, "loop": true,
             ],
+            // 非循环序列帧：验"播完最后一格就别再排帧唤醒"。
+            // 刻意不登记进 states —— 否则会改变各状态的素材数量，连带影响上面按数量断言的用例。
+            "idle-once": [
+                "file": "idle/idle-once/idle-once_001.webp",
+                "width": 300, "height": 400, "top": 0,
+                "dir": "idle/idle-once", "prefix": "idle-once",
+                "count": 3, "frameMs": 40, "loop": false,
+            ],
             "think-a": clip("thinking/think-a.webp", width: 320),
             "think-b": clip("thinking/think-b.webp", width: 286),
             "work-a": clip("working/work-a.webp", width: 349),
@@ -497,6 +505,93 @@ do {
     check(off.takeAutoInteraction() == nil, "autoInteractMs = 0 时彻底关闭")
     check(PetAnimation.autoInteractActions == ["feed", "praise", "pat"],
           "可自动触发的动作就是宿主 INTERACTIONS 里的那三个")
+}
+
+// 12) tick 排程：内核报出「下一次真的会变的时刻」—— 省电就靠这个
+//
+// 旧实现是固定重复定时器，间隔取帧间隔的一半（30ms/帧 → 每 15ms 一次，每秒 66 次），
+// 静图段也每秒白醒 4 次。现在由内核给出最近的事件时刻，调用方只在那时醒一次。
+// 这组断言钉住的就是"报出来的时刻必须和 advance 的口径一致"。
+do {
+    // 静图 + 默认设置：最近的事件是自动互动的掷骰子时刻（10 秒），而不是每 15ms 醒一次
+    let still = PetAnimation(manifest: manifest, random: SequenceRandom([0.0]).next)
+    check(still.currentClip?.isAnimated == false, "静图 clip 不会被当序列帧排唤醒")
+    check(still.nextEventMs() == 10_000,
+          "静图段：下一次事件是自动互动时刻，不是逐帧唤醒",
+          detail: "\(String(describing: still.nextEventMs()))")
+
+    // 彻底关掉所有周期行为之后，就没有任何理由再醒
+    still.autoInteractMs = 0
+    still.idleRotateMs = 0
+    check(still.nextEventMs() == nil,
+          "没有任何待办事件时返回 nil（不再空转唤醒）",
+          detail: "\(String(describing: still.nextEventMs()))")
+
+    // 序列帧：报出来的就是"距下一格还剩多久"，跟着 advance 一起走
+    let motion = PetAnimation(manifest: manifest, random: SequenceRandom([0.0]).next)
+    motion.autoInteractMs = 0
+    motion.idleRotateMs = 0
+    motion.applyOverlay(clip: "idle-motion", message: nil, ttlMs: 600_000)
+    check(motion.currentClip?.isAnimated == true, "浮层能切到序列帧 clip")
+    check(motion.nextEventMs() == 50, "序列帧：距下一格 50ms",
+          detail: "\(String(describing: motion.nextEventMs()))")
+    _ = motion.advance(elapsedMs: 30)
+    check(motion.nextEventMs() == 20, "推进 30ms 后还剩 20ms",
+          detail: "\(String(describing: motion.nextEventMs()))")
+    _ = motion.advance(elapsedMs: 20)
+    check(motion.nextEventMs() == 50, "翻到下一格后重新计时 50ms",
+          detail: "\(String(describing: motion.nextEventMs()))")
+
+    // 非循环 clip 播到最后一格之后就再也不该排帧唤醒（排了就是空转）
+    let once = PetAnimation(manifest: manifest, random: SequenceRandom([0.0]).next)
+    once.autoInteractMs = 0
+    once.idleRotateMs = 0
+    once.applyOverlay(clip: "idle-once", message: nil, ttlMs: 600_000)
+    for _ in 0..<3 { _ = once.advance(elapsedMs: 40) }
+    check(once.currentFrame?.file.hasSuffix("idle-once_003.webp") == true,
+          "非循环 clip 停在最后一格", detail: "\(String(describing: once.currentFrame?.file))")
+    check((once.nextEventMs() ?? 0) > 1_000,
+          "播完最后一格后不再报帧事件（下一次事件只剩浮层到期）",
+          detail: "\(String(describing: once.nextEventMs()))")
+
+    // 浮层 ttl 比帧更快到点时，浮层说了算
+    let soon = PetAnimation(manifest: manifest, random: SequenceRandom([0.0]).next)
+    soon.autoInteractMs = 0
+    soon.idleRotateMs = 0
+    soon.applyOverlay(action: "pat", message: "摸摸头", ttlMs: 1_200)
+    check(soon.nextEventMs() == 1_200, "浮层 ttl 到点也要叫醒",
+          detail: "\(String(describing: soon.nextEventMs()))")
+
+    // 通知的兜底过期同样是待办事件，且随模拟时间推进
+    let noticed = PetAnimation(manifest: manifest, random: SequenceRandom([0.0]).next)
+    noticed.autoInteractMs = 0
+    noticed.idleRotateMs = 0
+    noticed.noticeTtlMs = 5_000
+    _ = noticed.applyNotice(id: "n1", project: "p", state: .success, title: "t", detail: "d")
+    check(noticed.nextEventMs() == 5_000, "通知兜底过期要叫醒",
+          detail: "\(String(describing: noticed.nextEventMs()))")
+    _ = noticed.advance(elapsedMs: 4_000)
+    check(noticed.nextEventMs() == 1_000, "通知计时跟着 advance 走",
+          detail: "\(String(describing: noticed.nextEventMs()))")
+
+    // 多事件取最近：序列帧 50ms 比浮层 ttl 更快到点
+    let both = PetAnimation(manifest: manifest, random: SequenceRandom([0.0]).next)
+    both.autoInteractMs = 0
+    both.idleRotateMs = 0
+    both.applyOverlay(clip: "idle-motion", message: nil, ttlMs: 5_000)
+    check(both.nextEventMs() == 50, "多个待办事件时取最近的那个",
+          detail: "\(String(describing: both.nextEventMs()))")
+
+    // 报出来的时刻必须真的能被 advance 兑现（否则就是个永远等不到的唤醒）
+    let redeem = PetAnimation(manifest: manifest, random: SequenceRandom([0.0]).next)
+    redeem.autoInteractMs = 0
+    redeem.idleRotateMs = 0
+    redeem.applyOverlay(clip: "idle-motion", message: nil, ttlMs: 600_000)
+    if let due = redeem.nextEventMs() {
+        check(redeem.advance(elapsedMs: due), "按报出的时刻推进，画面确实变了（不是空唤醒）")
+    } else {
+        check(false, "序列帧 clip 必须报出帧事件")
+    }
 }
 
 print("")
