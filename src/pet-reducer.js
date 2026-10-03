@@ -13,7 +13,7 @@
  */
 
 import { PetMessageKind, PetState, createMessage } from './protocol.js'
-import { SessionEventKind, isSubagent, normalize, projectName, sessionId } from './events.js'
+import { SessionEventKind, isSubagent, normalize, parentSessionId, projectName, sessionId } from './events.js'
 import { HOLD_MS, ProjectStateMachine } from './state-machine.js'
 import { machineCopy, noticeCopy, parallelHeadline, rosterLine, singleDetail, stageCopy, statusCopy } from './pet-copy.js'
 
@@ -36,6 +36,32 @@ const ACTIVE_STATES = new Set([PetState.THINKING, PetState.WORKING, PetState.WAI
  * 比它低的（思考/干活/完成）都走"主角停留时间"，避免来回抖。
  */
 const URGENT_PRIORITY = 50
+
+/**
+ * 子会话的哪些事件算"在干活"。
+ *
+ * 只挑"确实推进了工作"的几类：回合开始、步骤推进、工具调用/结束、待办更新、审批。
+ * `turn/end` 单独处理 —— 它是"跑完了"，任何结束原因（含 blocked）都该让父会话收工。
+ */
+const CHILD_WORK_KINDS = new Set([
+  SessionEventKind.TURN_START,
+  SessionEventKind.STEP_START,
+  SessionEventKind.ASSISTANT_CHUNK,
+  SessionEventKind.ASSISTANT_MESSAGE,
+  SessionEventKind.TOOL_CALL,
+  SessionEventKind.TOOL_RESULT,
+  SessionEventKind.TODO_WRITE,
+  SessionEventKind.APPROVAL_ASKED,
+  SessionEventKind.APPROVAL_DECIDED,
+])
+
+/**
+ * 子会话多久没动静就不再算"在跑"。
+ *
+ * 子会话正常结束时会有 `turn/end`（我们据此摘掉它）；但它也可能崩了/被杀 ——
+ * 那就永远等不到 end，父会话会被永久钉在"进行中"。所以给一个静默窗口兜底。
+ */
+const CHILD_STALE_MS = 10 * 60 * 1000
 
 /**
  * 主角最短停留时间（毫秒）。
@@ -122,6 +148,15 @@ export class PetReducer {
     this.hostNotices = []
     /** 淘汰项目时欠下的一批清通知（由 #entry 触发，handle 开头补发） */
     this.evictionQueue = []
+    /**
+     * 每个父会话的子会话：`parentSession` → Map<childId, 最近一次活动时刻>。
+     *
+     * 为什么要它：子会话默认不占宠物一格，但它的活动必须让父会话"看起来在跑" ——
+     * 否则父会话的回合结束后气泡就回到待机，而桌面上其实还有子任务在干活。
+     * 用 Map 而不是计数：同一条子会话重复事件不会重复计，`turn/end` 也只减一次；
+     * 记时刻是为了**静默过期**（子会话没有 end 事件就崩了时，不能把父会话永久钉在"进行中"）。
+     */
+    this.childSessions = new Map()
     this.clock = 0
     this.lastSignature = undefined
   }
@@ -130,6 +165,8 @@ export class PetReducer {
     const next = value === true
     if (next === this.includeSubagents) return []
     this.includeSubagents = next
+    // 子会话自己占一格时，就不该再让父会话替它"显示在跑"（否则同一份工作被数两次）
+    this.childSessions = new Map()
     if (!next) {
       for (const [id, entry] of this.projects) {
         if (entry.subagent) this.projects.delete(id)
@@ -143,7 +180,8 @@ export class PetReducer {
     const normalized = normalize(event)
     if (!normalized) return []
     const subagent = isSubagent(session)
-    if (subagent && !this.includeSubagents) return []
+    // 子会话默认不占一格，但要把"我还在跑"记到父会话头上
+    if (subagent && !this.includeSubagents) return this.#trackChild(session, normalized)
 
     const evicted = this.#drainEvictions()
     const entry = this.#entry(session, subagent)
@@ -247,6 +285,14 @@ export class PetReducer {
     const messages = []
     if (entry) messages.push(...this.#clearNotices(entry, 'disposed'))
     if (this.projects.delete(id)) messages.push(...this.#render({ force: true }))
+
+    // 子会话被销毁 = 它不再跑了：父会话的"进行中"要跟着收
+    const parentId = parentSessionId(session)
+    const children = parentId ? this.childSessions.get(parentId) : undefined
+    if (children?.delete(id)) {
+      if (children.size === 0) this.childSessions.delete(parentId)
+      messages.push(...this.#render({ force: true }))
+    }
     return messages
   }
 
@@ -323,7 +369,11 @@ export class PetReducer {
     for (const entry of this.projects.values()) {
       if (entry.machine.tick(now)) changed = true
     }
-    return changed ? this.#render() : []
+    // 顺带让"子会话静默过期"能自愈：不重算的话，父会话会一直显示进行中，
+    // 直到下一条事件到来。#render 自己按签名去重，重复调用不会刷屏。
+    const messages = this.#render()
+    if (!changed && messages.length === 0) return []
+    return messages
   }
 
   /**
@@ -345,8 +395,8 @@ export class PetReducer {
     return {
       id: entry.machine.id,
       project: entry.project,
-      state: entry.machine.state,
-      message: machineMessage(entry.machine),
+      state: this.#effectiveState(entry),
+      message: this.#displayMessage(entry),
     }
   }
 
@@ -355,9 +405,10 @@ export class PetReducer {
     return this.#sorted().map((entry) => ({
       id: entry.machine.id,
       project: entry.project ?? '未命名',
-      state: entry.machine.state,
-      message: machineMessage(entry.machine),
-      active: ACTIVE_STATES.has(entry.machine.state),
+      state: this.#effectiveState(entry),
+      message: this.#displayMessage(entry),
+      active: ACTIVE_STATES.has(this.#effectiveState(entry)),
+      subagents: this.#childCount(entry.machine.id),
     }))
   }
 
@@ -401,6 +452,15 @@ export class PetReducer {
     if (this.evictionQueue.length === 0) return []
     const queued = this.evictionQueue
     this.evictionQueue = []
+    /**
+     * 每个父会话的子会话：`parentSession` → Map<childId, 最近一次活动时刻>。
+     *
+     * 为什么要它：子会话默认不占宠物一格，但它的活动必须让父会话"看起来在跑" ——
+     * 否则父会话的回合结束后气泡就回到待机，而桌面上其实还有子任务在干活。
+     * 用 Map 而不是计数：同一条子会话重复事件不会重复计，`turn/end` 也只减一次；
+     * 记时刻是为了**静默过期**（子会话没有 end 事件就崩了时，不能把父会话永久钉在"进行中"）。
+     */
+    this.childSessions = new Map()
     return queued
   }
 
@@ -420,6 +480,84 @@ export class PetReducer {
       messages.push(createMessage(PetMessageKind.NOTICE_CLEAR, { id: dropped.id, reason: 'capacity' }))
     }
     return messages
+  }
+
+  /**
+   * 子会话的活动登记：让父会话显示成"进行中"。
+   *
+   * 开工的事件把它加进父会话的活跃集合，`turn/end` 把它移出去（任何结束原因都算 ——
+   * blocked 的子会话是在等人，不该让父会话一直显示"在跑"）。
+   */
+  #trackChild(session, event) {
+    const parentId = parentSessionId(session)
+    const childId = sessionId(session)
+    if (!parentId || parentId === childId) return []
+
+    const active = CHILD_WORK_KINDS.has(event.kind)
+    const finished = event.kind === SessionEventKind.TURN_END
+    if (!active && !finished) return []
+
+    const children = this.childSessions.get(parentId) ?? new Map()
+    const before = this.#activeChildren(parentId).size
+    if (finished) children.delete(childId)
+    else children.set(childId, this.now())
+    if (children.size === 0) this.childSessions.delete(parentId)
+    else this.childSessions.set(parentId, children)
+    if (this.#activeChildren(parentId).size === before) return []
+
+    // 父会话可能还没进过账本（插件是中途启动的）：补一个，好让它有气泡可显示
+    const entry = this.#parentEntry(parentId, session)
+    entry.touchedAt = ++this.clock
+    return this.#render({ force: true })
+  }
+
+  /** 取（必要时建）父会话的账本条目。 */
+  #parentEntry(parentId, childSession) {
+    const existing = this.projects.get(parentId)
+    if (existing) return existing
+    const cwd = childSession?.header?.cwd ?? childSession?.cwd
+    const synthetic = { header: { id: parentId, cwd }, cwd }
+    const entry = this.#entry(synthetic, false)
+    entry.project = projectName(synthetic, {}) ?? entry.project
+    return entry
+  }
+
+  /** 还在活跃窗口内的子会话（静默太久的当作已经不在跑了）。 */
+  #activeChildren(parentId) {
+    const children = this.childSessions.get(String(parentId))
+    if (!children) return new Map()
+    const now = this.now()
+    return new Map([...children].filter(([, at]) => now - at < CHILD_STALE_MS))
+  }
+
+  #childCount(id) {
+    return this.#activeChildren(id).size
+  }
+
+  /**
+   * 这个项目对外的**台词**。
+   *
+   * 与 `#effectiveState` 配对：状态被"子任务在跑"改写时，台词也要跟着改 ——
+   * 否则会出现"状态是 WORKING、嘴上却说'搞定！给自己鼓个掌'"。三处消费
+   * （focus / roster / render）都走这里，不许各判各的。
+   */
+  #displayMessage(entry) {
+    const delegated = this.#effectiveState(entry) === PetState.WORKING && entry.machine.state !== PetState.WORKING
+    return delegated ? statusCopy('delegating') : machineMessage(entry.machine)
+  }
+
+  /**
+   * 这个项目**对外**该显示成什么状态。
+   *
+   * 自己的状态机空闲/刚完成，但还有子会话在跑 → 显示成 WORKING（进行中）；
+   * 其余情况照旧用自己的状态（WAITING/ERROR 这类要人处理的不该被"有子任务"盖掉）。
+   */
+  #effectiveState(entry) {
+    const own = entry.machine.state
+    if (this.#childCount(entry.machine.id) === 0) return own
+    return own === PetState.IDLE || own === PetState.SUCCESS || own === PetState.DISCONNECTED
+      ? PetState.WORKING
+      : own
   }
 
   #clearNotices(entry, reason) {
@@ -447,7 +585,7 @@ export class PetReducer {
   /** 按"优先级 → 最近更新 → id"排序，第一个就是主角。 */
   #sorted() {
     return [...this.projects.values()].sort((left, right) => {
-      const byPriority = (PRIORITY[right.machine.state] ?? 0) - (PRIORITY[left.machine.state] ?? 0)
+      const byPriority = (PRIORITY[this.#effectiveState(right)] ?? 0) - (PRIORITY[this.#effectiveState(left)] ?? 0)
       return byPriority
         || right.machine.updatedAt - left.machine.updatedAt
         || left.machine.id.localeCompare(right.machine.id)
@@ -488,9 +626,11 @@ export class PetReducer {
   #counts() {
     let running = 0
     let waiting = 0
-    for (const { machine } of this.projects.values()) {
-      if (machine.state === PetState.WAITING) waiting += 1
-      else if (ACTIVE_STATES.has(machine.state)) running += 1
+    for (const entry of this.projects.values()) {
+      // 用生效状态：父会话自己空闲、但子任务还在跑时也算"在跑"
+      const state = this.#effectiveState(entry)
+      if (state === PetState.WAITING) waiting += 1
+      else if (ACTIVE_STATES.has(state)) running += 1
     }
     return { running, waiting }
   }
@@ -498,9 +638,9 @@ export class PetReducer {
   /** 第二行用的项目条目：优先列「有事在做」的，全空闲时才列空闲项目。 */
   #rosterEntries() {
     const sorted = this.#sorted()
-    const active = sorted.filter((entry) => ACTIVE_STATES.has(entry.machine.state))
+    const active = sorted.filter((entry) => ACTIVE_STATES.has(this.#effectiveState(entry)))
     return (active.length > 0 ? active : sorted)
-      .map((entry) => ({ name: entry.project ?? '未命名', state: entry.machine.state }))
+      .map((entry) => ({ name: entry.project ?? '未命名', state: this.#effectiveState(entry) }))
   }
 
   #render({ force = false } = {}) {
@@ -515,21 +655,23 @@ export class PetReducer {
 
     const machine = entry.machine
     const counts = this.#counts()
+    const state = this.#effectiveState(entry)
     const parallel = counts.running + counts.waiting >= 2
 
-    const headline = parallel ? parallelHeadline(counts) : machineMessage(machine)
+    const headline = parallel ? parallelHeadline(counts) : this.#displayMessage(entry)
     const detail = parallel
       ? rosterLine(this.#rosterEntries(), { max: this.rosterSize })
       : singleDetail({
         project: entry.project,
-        stage: machineStage(machine),
+        // 阶段也跟状态一致：被"子任务在跑"接管时不说自己原来的阶段
+        stage: state !== machine.state ? '子任务中' : machineStage(machine),
         progress: machine.progress,
         task: machine.task,
       })
 
     const signature = [
       machine.id,
-      machine.state,
+      state,
       headline,
       detail,
       counts.running,
@@ -540,7 +682,7 @@ export class PetReducer {
     this.lastSignature = signature
 
     return [createMessage(PetMessageKind.STATE, {
-      state: machine.state,
+      state,
       message: headline,
       detail: detail || entry.project || 'DSH',
       parallel: parallel ? { running: counts.running, waiting: counts.waiting, projects: this.projects.size } : undefined,

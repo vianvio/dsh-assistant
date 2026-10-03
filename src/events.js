@@ -156,6 +156,17 @@ export function isSubagent(session) {
 }
 
 /**
+ * 父会话 id：子会话头里的 `parentSession`（顶层会话没有这个字段）。
+ *
+ * 用途：子会话本身不占宠物一格，但"它的子任务还在跑"必须让**父会话**显示成进行中 ——
+ * 否则父会话回合结束后气泡就变回待机，而桌面上其实还有活在跑。
+ */
+export function parentSessionId(session) {
+  const value = session?.header?.parentSession ?? session?.parentSession
+  return value === undefined || value === null || value === '' ? undefined : String(value)
+}
+
+/**
  * 项目名：优先事件里的 projectName（最新），再退回 cwd，最后退回会话标题。
  * 结果会被截断 —— 气泡里一行放不下长路径。
  */

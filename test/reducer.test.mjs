@@ -566,3 +566,103 @@ test('通知：会话被淘汰时，它挂着的通知一起清（原生端不�
       `孤儿通知：${notice.id}（会话 ${notice.sessionId} 已不在账本里）`)
   }
 })
+
+/* ------------------------------------------------- 子会话 = 父会话"进行中" */
+
+test('子会话：父会话回合结束后，子任务还在跑 → 父项目显示进行中', () => {
+  const reducer = new PetReducer()
+  const parent = { header: { id: 'p1', cwd: '/tmp/proj', origin: 'human' }, cwd: '/tmp/proj' }
+  const child = { header: { id: 'c1', parentSession: 'p1', origin: 'subagent', delegationDepth: 1, cwd: '/tmp/proj' }, cwd: '/tmp/proj' }
+
+  reducer.handle(parent, { type: 'turn/start', seq: 1 })
+  const done = reducer.handle(parent, { type: 'turn/end', seq: 2, data: { reason: { kind: 'completed' } } })
+  assert.equal(done.find((message) => message.kind === 'state').state, PetState.SUCCESS, '父会话自己先跑完')
+
+  const started = reducer.handle(child, { type: 'turn/start', seq: 1 })
+  const state = started.find((message) => message.kind === 'state')
+  assert.ok(state, '子会话开工要让父会话重新有状态可显示')
+  assert.equal(state.state, PetState.WORKING, '有子任务在跑 = 进行中')
+  assert.match(state.message, /子任务/)
+  assert.match(state.detail, /子任务中/)
+  assert.equal(reducer.focus().state, PetState.WORKING)
+  assert.deepEqual(reducer.roster().map((entry) => [entry.state, entry.subagents]), [[PetState.WORKING, 1]])
+
+  // 子会话结束 → 父会话回到自己的状态
+  const finished = reducer.handle(child, { type: 'turn/end', seq: 2, data: { reason: { kind: 'completed' } } })
+  assert.equal(finished.find((message) => message.kind === 'state').state, PetState.SUCCESS, '子任务跑完了就回父会话自己的状态')
+  assert.equal(reducer.roster()[0].subagents, 0)
+})
+
+test('子会话：多个子任务，全部结束才算收工', () => {
+  const reducer = new PetReducer()
+  const parent = { header: { id: 'p1', cwd: '/tmp/proj', origin: 'human' }, cwd: '/tmp/proj' }
+  const childA = { header: { id: 'c1', parentSession: 'p1', origin: 'subagent', cwd: '/tmp/proj' }, cwd: '/tmp/proj' }
+  const childB = { header: { id: 'c2', parentSession: 'p1', origin: 'subagent', cwd: '/tmp/proj' }, cwd: '/tmp/proj' }
+  reducer.handle(parent, { type: 'turn/start', seq: 1 })
+  reducer.handle(parent, { type: 'turn/end', seq: 2, data: { reason: { kind: 'completed' } } })
+  reducer.handle(childA, { type: 'turn/start', seq: 1 })
+  reducer.handle(childB, { type: 'turn/start', seq: 1 })
+  assert.equal(reducer.roster()[0].subagents, 2)
+
+  reducer.handle(childA, { type: 'turn/end', seq: 2, data: { reason: { kind: 'completed' } } })
+  assert.equal(reducer.focus().state, PetState.WORKING, '还有一个在跑就还是进行中')
+  assert.equal(reducer.roster()[0].subagents, 1)
+
+  reducer.handle(childB, { type: 'turn/end', seq: 2, data: { reason: { kind: 'completed' } } })
+  assert.equal(reducer.roster()[0].subagents, 0)
+})
+
+test('子会话：销毁 / 静默超时 / 更急的状态都不该被"有子任务"盖掉', () => {
+  let now = 1_000_000
+  const reducer = new PetReducer({ now: () => now })
+  const parent = { header: { id: 'p1', cwd: '/tmp/proj', origin: 'human' }, cwd: '/tmp/proj' }
+  const child = { header: { id: 'c1', parentSession: 'p1', origin: 'subagent', cwd: '/tmp/proj' }, cwd: '/tmp/proj' }
+  reducer.handle(parent, { type: 'turn/start', seq: 1 })
+  reducer.handle(parent, { type: 'turn/end', seq: 2, data: { reason: { kind: 'completed' } } })
+  reducer.handle(child, { type: 'turn/start', seq: 1 })
+  assert.equal(reducer.focus().state, PetState.WORKING)
+
+  // ① 父会话自己在等人（WAITING 更急）→ 不该被改写
+  //    （注意先让它回到 THINKING：SUCCESS 的停留态里没有 QUESTION 这条迁移）
+  reducer.handle(parent, { type: 'turn/start', seq: 3 })
+  const waiting = reducer.handle(parent, { type: 'tool/call', seq: 4, data: { name: 'ask_user_question', callId: 'q1' } })
+  assert.equal(waiting.find((message) => message.kind === 'state').state, PetState.WAITING, '要人处理的状态优先')
+
+  // ② 子会话被销毁 → 收工
+  now += 1000
+  reducer.handle(parent, { type: 'turn/start', seq: 5 })
+  reducer.handle(parent, { type: 'turn/end', seq: 6, data: { reason: { kind: 'completed' } } })
+  assert.equal(reducer.roster()[0].subagents, 1)
+  reducer.disposeSession(child)
+  assert.equal(reducer.roster()[0].subagents, 0, '子会话销毁 = 不跑了')
+
+  // ③ 子会话崩了（没有 end 事件）→ 静默超时后自愈，不会永久钉在"进行中"
+  const child2 = { header: { id: 'c2', parentSession: 'p1', origin: 'subagent', cwd: '/tmp/proj' }, cwd: '/tmp/proj' }
+  reducer.handle(child2, { type: 'turn/start', seq: 1 })
+  assert.equal(reducer.roster()[0].subagents, 1)
+  now += 11 * 60 * 1000
+  const healed = reducer.tick(now)
+  assert.equal(reducer.roster()[0].subagents, 0, '静默超过窗口就不再算在跑')
+  assert.ok(healed.some((message) => message.kind === 'state'), 'tick 要把画面收回来')
+})
+
+test('子会话：打开"含子 Agent"时，子会话自己占一格，父会话不再重复显示在跑', () => {
+  const reducer = new PetReducer({ includeSubagents: true })
+  const parent = { header: { id: 'p1', cwd: '/tmp/proj', origin: 'human' }, cwd: '/tmp/proj' }
+  const child = { header: { id: 'c1', parentSession: 'p1', origin: 'subagent', cwd: '/tmp/proj' }, cwd: '/tmp/proj' }
+  reducer.handle(parent, { type: 'turn/start', seq: 1 })
+  reducer.handle(parent, { type: 'turn/end', seq: 2, data: { reason: { kind: 'completed' } } })
+  reducer.handle(child, { type: 'turn/start', seq: 1 })
+  const roster = reducer.roster()
+  assert.equal(roster.length, 2, '子会话自己是独立一格')
+  assert.equal(roster.find((entry) => entry.id === 'p1').subagents, 0, '父会话不重复计这份工作')
+})
+
+test('子会话：没有父会话的隐藏会话（比如日报自己跑的）不会凭空造出一个项目', () => {
+  const reducer = new PetReducer()
+  // 插件跑日报用的隐藏会话：origin=subagent，但没有 parentSession
+  const hidden = { header: { id: 'assistant-review-1', cwd: '/tmp/proj', origin: 'subagent' }, cwd: '/tmp/proj' }
+  assert.deepEqual(reducer.handle(hidden, { type: 'turn/start', seq: 1 }), [], '不该产出任何消息')
+  assert.equal(reducer.roster().length, 0, '也不该凭空多出一个"进行中"的项目')
+  assert.equal(reducer.focus(), undefined)
+})

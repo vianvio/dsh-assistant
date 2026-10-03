@@ -17,6 +17,12 @@ const COPY = Object.freeze({
     '新任务收到，捋一下步骤',
     '开工前先摊开工作台',
   ],
+  /** 自己的回合已经结束，但它的**子会话/后台任务**还在跑 —— 项目仍然是"进行中" */
+  delegating: [
+    '子任务在跑，我盯着',
+    '把活派下去了，等它回来',
+    '子任务还在忙',
+  ],
   thinking: [
     '正在认真想下一步',
     '脑子里正在排流程',
@@ -117,6 +123,7 @@ export function stageCopy(key) {
     case 'testing': return '验证阶段'
     case 'commanding': return '执行阶段'
     case 'working': return '执行阶段'
+    case 'delegating': return '子任务中'
     case 'wrapping': return '整理阶段'
     case 'resuming': return '继续执行'
     case 'waiting': return '等待确认'
