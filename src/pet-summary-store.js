@@ -228,9 +228,10 @@ export function summarizedUntil(sessionId, path = storePath(), options = {}) {
 /**
  * 跨进程互斥：`<path>.lock` 用 `wx` 独占创建。
  *
- * 默认**异步等待**，不占住事件循环 —— 以前用 `Atomics.wait` 同步自旋，
- * 实测单次 appendPart 能把宿主冻 4 秒（50ms 定时器迟到 3955ms）。
- * 同步自旋只留给没有 await 机会的调用方（`withStoreLockSync`）。
+ * 只有**异步等待**这一种：以前用 `Atomics.wait` 同步自旋，实测单次 appendPart 能把宿主
+ * 冻 4 秒（50ms 定时器迟到 3955ms）。那个同步版（`withStoreLockSync`）已经删掉 ——
+ * 全仓库零调用点，留着就是"哪天有人图省事用了它，宿主又被冻住"。
+ * 没有 await 机会的调用方请把调用点改成异步，而不是把事件循环让出去。
  *
  * 夺锁要**先确认持锁进程已经不在**；进程还活着时只有超过 LOCK_ABANDON_MS 才当它卡死。
  * 以前只看锁文件年龄，活着的持有者也会在 10 秒后被夺锁。
@@ -258,33 +259,6 @@ export async function withStoreLock(path, run, { logger, timeoutMs = LOCK_TIMEOU
       }
       if (Date.now() >= deadline) throw new Error(`summaries 存储被占用（${lockPath}），本次放弃写入`)
       await sleep(LOCK_RETRY_MS)
-    }
-  }
-}
-
-/** 同步版（没有 await 机会的调用方）。会阻塞事件循环，日报路径不要用。 */
-export function withStoreLockSync(path, run) {
-  const lockPath = `${path}.lock`
-  mkdirSync(dirname(path), { recursive: true })
-  const deadline = Date.now() + LOCK_TIMEOUT_MS
-  for (;;) {
-    try {
-      const fd = openSync(lockPath, 'wx')
-      try {
-        writeFileSync(fd, `${process.pid}\n`, 'utf8')
-        return run()
-      } finally {
-        closeSync(fd)
-        try { unlinkSync(lockPath) } catch { /* 已经被人清掉了 */ }
-      }
-    } catch (error) {
-      if (error?.code !== 'EEXIST') throw error
-      if (isStaleLock(lockPath)) {
-        try { unlinkSync(lockPath) } catch { /* 别人抢先清了 */ }
-        continue
-      }
-      if (Date.now() >= deadline) throw new Error(`summaries 存储被占用（${lockPath}），本次放弃写入`)
-      sleepSync(LOCK_RETRY_MS)
     }
   }
 }
@@ -324,7 +298,3 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-/** 同步睡一会儿（只给 withStoreLockSync 用）。 */
-function sleepSync(ms) {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
-}

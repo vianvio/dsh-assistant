@@ -13,25 +13,45 @@
  */
 
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { test } from 'node:test'
 
 const root = process.cwd()
 const read = (relative) => readFileSync(join(root, relative), 'utf8')
 
-/** 做 IO / 面向用户的模块：必须有日志通道，且不许新增未登记的空 catch。 */
-const IO_MODULES = [
+/**
+ * 做 IO 的模块**从文件系统推**，不是手写名单 —— 手写名单漏一个新模块，盘点就白做了
+ *（这正是"日志盘点漏了 logger.* 通道"那条的形状：盘点是人工的，于是漏的永远是没人想起来的那块）。
+ */
+const IO_PATTERNS = /node:fs|node:child_process|node:net|node:http|node:https|readFileSync|writeFileSync|readdir|statSync|spawn\(|createServer/u
+
+/** 面向用户、但自己不碰 fs 的模块（手写：这部分靠人判断，所以单列出来）。 */
+const USER_FACING = [
   'src/index.js',
   'src/pet.js',
-  'src/pet-process.js',
   'src/pet-settings.js',
   'src/pet-endpoint.js',
   'src/pet-summary.js',
   'src/pet-summary-agent.js',
-  'src/pet-summary-store.js',
-  'src/pet-summary-activity.js',
+  'src/pet-summary-corpus.js',
 ]
+
+/** 唯一的例外：浏览器端 bundle 跑在面板里，没有宿主 logger（日志一律走宿主侧）。 */
+const NO_LOGGER_BY_DESIGN = ['src/client.js']
+
+/** src 下所有宿主模块（浏览器 bundle 除外）。 */
+function hostModules() {
+  return readdirSync(join(root, 'src'))
+    .filter((name) => name.endsWith('.js'))
+    .map((name) => `src/${name}`)
+    .filter((file) => !NO_LOGGER_BY_DESIGN.includes(file))
+}
+
+/** 碰 fs/进程/网络的模块。 */
+function ioModules() {
+  return hostModules().filter((file) => IO_PATTERNS.test(read(file)))
+}
 
 /**
  * 逐条登记的"故意咽下去"，键是 `文件:近似行` 的稳定标识（用注释文本定位更稳）。
@@ -76,8 +96,22 @@ function silentCatches(source) {
   return found
 }
 
-test('日志：做 IO 的模块都得有日志通道（失败不许凭空消失）', () => {
-  for (const file of IO_MODULES) {
+test('日志：盘点自己会漏的话就没意义 —— IO 模块必须逐个有日志通道（名单从文件系统推）', () => {
+  const files = ioModules()
+  // 识别器本身也要被守：模式写坏了（比如漏了 node:fs）会让这条用例变成空转
+  for (const must of ['src/pet-summary-store.js', 'src/pet-summary-activity.js', 'src/pet-process.js']) {
+    assert.ok(files.includes(must), `识别器漏了碰 IO 的模块：${must}（实际认出 ${files.join(', ')}）`)
+  }
+  const noLog = files.filter((file) => !/logger\??\.(debug|info|warn|error)\??\.\(/u.test(read(file)))
+  assert.deepEqual(noLog, [], `这些模块碰 IO 却一句话都不说（失败会凭空消失）：\n  ${noLog.join('\n  ')}`)
+  // 例外只有"设计上不打日志"的浏览器 bundle，且必须在清单里登记
+  for (const file of NO_LOGGER_BY_DESIGN) {
+    assert.match(read(file), /^\/\*\*|^\/\*/u, `${file} 得是真有豁免理由的模块`)
+  }
+})
+
+test('日志：面向用户的模块都得有日志通道（这条名单是人工的，所以要单列出来守）', () => {
+  for (const file of USER_FACING) {
     const source = read(file)
     assert.match(source, /logger/u, `${file} 应该持有 logger`)
     assert.match(
@@ -90,7 +124,7 @@ test('日志：做 IO 的模块都得有日志通道（失败不许凭空消失�
 
 test('日志：每条日志都带插件前缀（用户能一键过滤出这个插件的行）', () => {
   const offenders = []
-  for (const file of IO_MODULES) {
+  for (const file of hostModules()) {
     const source = read(file)
     for (const [index, line] of source.split('\n').entries()) {
       const match = /logger\??\.(?:debug|info|warn|error)\??\.\(\s*[`']([^`']{0,40})/u.exec(line)
@@ -115,7 +149,7 @@ test('日志：空 catch 全部有据可查（新增一条没登记的就红）'
   }
 
   const unregistered = []
-  for (const file of IO_MODULES) {
+  for (const file of hostModules()) {
     const source = read(file)
     for (const body of silentCatches(source)) {
       if (registered.some((entry) => entry.startsWith(`${file}:`) && body.includes(entry.split(':')[1]))) continue
