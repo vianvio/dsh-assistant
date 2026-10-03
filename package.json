@@ -1,6 +1,6 @@
 {
   "name": "dsh-assistant",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "DSH小助手：原生 Swift 悬浮窗负责展示与交互，宿主插件负责把它接到 DSH 会话状态（含今日工作总结）",
   "keywords": [
     "dsh",
