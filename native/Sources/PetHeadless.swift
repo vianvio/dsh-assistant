@@ -17,7 +17,7 @@ final class PetHeadless {
         self.animation = PetAnimation(manifest: manifest)
         self.channel = channel
         let saved = layout.load()
-        self.scale = saved?.scale ?? PetLayoutSnapshot.defaultScale
+        self.scale = PetConfigRules.scale(saved?.scale ?? PetLayoutSnapshot.defaultScale)
         self.bubbleEnabled = saved?.bubbleEnabled ?? true
     }
 
@@ -62,8 +62,11 @@ final class PetHeadless {
                 project: PetProtocol.stringValue(message["project"])
             )
         case "config":
-            if let value = PetProtocol.doubleValue(message["scale"]) { scale = min(2.0, max(0.15, value)) }
-            if let value = message["bubbleEnabled"] as? Bool { bubbleEnabled = value }
+            // 与 PetController 共用同一份白名单与归一化（PetConfigRules），
+            // 免得"自检走的是一条路径、真机走的是另一条"
+            let patch = PetConfigRules.patch(from: message)
+            if let value = patch.scale { scale = value }
+            if let value = patch.bubbleEnabled { bubbleEnabled = value }
         case "summary":
             // 与 PetController 同一条回执：宿主/探针据此确认正文真的到了。
             // hintChars = 结果页底部那行提示（后台总结关着时宿主才会发）

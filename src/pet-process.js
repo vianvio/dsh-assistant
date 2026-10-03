@@ -29,6 +29,8 @@ import {
   decodeMessage,
   encodeMessage,
 } from './protocol.js'
+// 协议一致性自检要发"生产端真的会发"的通知形状 —— 与 reducer 共用同一个构造器
+import { noticeMessage } from './pet-reducer.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(here, '..')
@@ -48,6 +50,16 @@ export const defaultHelperPath = resolve(
 /** 素材包目录（helper 用它找 pet-manifest.json）。 */
 export function defaultAssetRoot() {
   return process.env.DSH_ASSISTANT_ASSET_ROOT || resolve(packageRoot, 'assets', 'pack')
+}
+
+/**
+ * helper 路径的解析规则 —— **只有这一处**：显式传入 > 环境变量 > 默认。
+ *
+ * 以前这条规则在 `PetProcess.start()` 与 `mountPet` 的可用性检查里各写一遍，
+ * 后者还用无参默认值判（等于永远忽略显式传入的 helperPath）。
+ */
+export function resolveHelperPath(explicit) {
+  return explicit || process.env.DSH_ASSISTANT_HELPER || defaultHelperPath
 }
 
 /** helper 是否可用；不可用时宿主只告警、不拉起进程。 */
@@ -99,7 +111,7 @@ export class PetProcess {
   /** 启动（幂等）：已被显式停止或 helper 缺失时不会拉起。 */
   start() {
     if (this.child || this.stopped) return this.child
-    const helperPath = this.options.helperPath ?? process.env.DSH_ASSISTANT_HELPER ?? defaultHelperPath
+    const helperPath = resolveHelperPath(this.options.helperPath)
     if (!helperAvailable(helperPath)) {
       this.stopped = true
       this.logger.warn?.(
@@ -424,7 +436,8 @@ export function probeProtocol(helperPath, { assetRoot, timeoutMs = 8000 } = {}) 
     createMessage(PetMessageKind.STATE, { state: 'WORKING', message: '自检', detail: 'DSH · 自检' }),
     createMessage(PetMessageKind.PULSE, { state: 'SUCCESS', ttlMs: 100, message: '好了', resumeState: 'IDLE' }),
     createMessage(PetMessageKind.OVERLAY, { action: 'pat', message: '摸头', ttlMs: 100 }),
-    createMessage(PetMessageKind.NOTICE, { id: 'self-check:1', project: '自检', state: 'SUCCESS', title: '任务完成了', detail: '自检 · ok' }),
+    // 与 reducer 同一个构造器：协议一致性自检必须发"生产端真的会发"的形状
+    noticeMessage({ id: 'self-check:1', project: '自检', state: 'SUCCESS', title: '任务完成了', detail: '自检 · ok', sessionId: 'self-check' }),
     createMessage(PetMessageKind.NOTICE_CLEAR, { id: 'self-check:1', reason: 'done' }),
     createMessage(PetMessageKind.SUMMARY, { title: '自检', markdown: '# 自检\n- ok' }),
     createMessage(PetMessageKind.COMMAND, { action: 'home' }),

@@ -10,15 +10,16 @@
  * 互动台词在 pet-interactions.js，"今日干了什么"的编排在 pet-summary.js。
  */
 
-import { PetProcess, defaultAssetRoot, helperAvailable } from './pet-process.js'
+import { PetProcess, defaultAssetRoot, helperAvailable, resolveHelperPath } from './pet-process.js'
 import { PetReducer } from './pet-reducer.js'
-import { sessionId } from './events.js'
+import { SessionEventKind, isSubagent, sessionId } from './events.js'
 import { INTERACTIONS, createPatTracker, interactionMessage, zoneToAction } from './pet-interactions.js'
-import { generateTodaySummary, generateTodaySummaryStepped, refinePendingParts, summaryHint } from './pet-summary.js'
-import { createSessionDigests } from './pet-summary-digest.js'
-import { reportLengthWarning } from './pet-summary-corpus.js'
+import {
+  createDigestCache, generateTodaySummary, generateTodaySummaryStepped, refinePendingParts, summaryHint,
+} from './pet-summary.js'
 import { PetMessageKind, PetState, createMessage } from './protocol.js'
-import { BUBBLE_THEMES, clampScale } from './pet-settings.js'
+import { noticeMessage } from './pet-reducer.js'
+import { NATIVE_FIELDS, WRITABLE_FIELDS, normalizeField } from './pet-settings.js'
 
 /**
  * 挂载桌面宠物。
@@ -43,7 +44,7 @@ export function mountPet({ ctx, settings, eventCtx, logger = console, tuning = {
    * 后台总结是**每次会话压缩**都会跑的，没有这一层就是每轮全量重扫 ——
    * 实测 179 个会话、1.09 GB 解压内容、83 万条事件，而真正进日报的只有 0.8%。
    */
-  const digests = createSessionDigests()
+  const digests = createDigestCache()
   /**
    * 这一次 ready 是不是"进程刚起来的那一次"。
    *
@@ -58,9 +59,14 @@ export function mountPet({ ctx, settings, eventCtx, logger = console, tuning = {
       logger.info?.('dsh-assistant: 已在设置里关闭，跳过启动')
       return
     }
-    if (!helperAvailable()) {
+    // 判"helper 在不在"要用**同一个路径**（resolveHelperPath 是唯一那份规则）：
+    // 以前这里用无参默认值判一次，显式传 helperPath 的调用方（探针/测试）
+    // 会被这个提前返回挡掉。注意别写成 `process.env` —— 这个作用域里的 process
+    // 是 PetProcess 句柄，不是全局对象。
+    const helperPath = resolveHelperPath(tuning.processOptions?.helperPath)
+    if (!helperAvailable(helperPath)) {
       logger.warn?.(
-        'dsh-assistant: 缺少原生 helper，桌面宠物未启动；'
+        `dsh-assistant: 缺少原生 helper（${helperPath}），桌面宠物未启动；`
         + '在插件目录执行 `npm run build:helper` 后重启 DSH（插件其余部分不受影响）。',
       )
       return
@@ -114,6 +120,15 @@ export function mountPet({ ctx, settings, eventCtx, logger = console, tuning = {
     if (process) process.send(message)
   }
 
+  /**
+   * 宿主自己发的通知：交给 reducer 记账（它同时负责补发与精确清除）。
+   * reducer 还没建起来（极早期）时退回直发，至少界面上能看到。
+   */
+  const postNotice = (payload) => (reducer ? reducer.postNotice(payload) : noticeMessage(payload))
+  const clearNotice = (id, reason) => (reducer
+    ? reducer.clearNotice(id, reason)
+    : createMessage(PetMessageKind.NOTICE_CLEAR, { id, reason }))
+
   // 连点三次摸头触发庆祝
   const registerPat = createPatTracker()
 
@@ -140,6 +155,12 @@ export function mountPet({ ctx, settings, eventCtx, logger = console, tuning = {
    */
   const handleInteraction = (message) => {
     const action = String(message.action ?? '')
+    // 原生端的通知过期/被挤掉时会上报 id 列表：宿主账本不跟着清的话，
+    // 宿主以为还挂着、屏幕上早就没了（而且之后发的 notice-clear 会落空）
+    if (action === 'notice-dropped') {
+      for (const id of Array.isArray(message.ids) ? message.ids : []) reducer?.dismissNotice(String(id))
+      return
+    }
     if (action.startsWith('notice-')) {
       reducer?.dismissNotice(String(message.noticeId ?? ''))
       // 点通知 = 想看那个会话 → 让客户端切过去（原生端自己打不开 DSH 界面）
@@ -160,14 +181,21 @@ export function mountPet({ ctx, settings, eventCtx, logger = console, tuning = {
     send(interactionMessage(resolved, { seed: Date.now(), celebrate }))
   }
 
-  /** 用户在原生菜单里改了大小/气泡：写回设置，保证两边一致。 */
+  /**
+   * 用户在原生菜单里改了大小/气泡：写回设置，保证两边一致。
+   *
+   * 字段清单**从设置契约派生**（SETTINGS_FIELDS + WRITABLE_FIELDS），不再手写 if 链：
+   * 以前这里硬编码 5 个字段、WRITABLE_FIELDS 有 10 个、OVERRIDABLE_FIELDS 有 7 个，
+   * 菜单哪天多上报一个字段（比如自动互动开关）就会被这串 if 静默吞掉，连日志都没有。
+   */
   const handleNativeSettings = (message) => {
     const patch = {}
-    if (Number.isFinite(message.scale)) patch.scale = clampScale(Number(message.scale))
-    if (typeof message.bubbleEnabled === 'boolean') patch.bubbleEnabled = message.bubbleEnabled
-    if (typeof message.reducedMotion === 'boolean') patch.reducedMotion = message.reducedMotion
-    if (typeof message.soundEnabled === 'boolean') patch.soundEnabled = message.soundEnabled
-    if (BUBBLE_THEMES.includes(message.bubbleTheme)) patch.bubbleTheme = message.bubbleTheme
+    for (const field of WRITABLE_FIELDS) {
+      if (!(field in message)) continue
+      const normalized = normalizeField(field, message[field])
+      if (normalized === undefined) continue
+      patch[field] = normalized
+    }
     if (Object.keys(patch).length === 0) return
     void Promise.resolve(settings.update(patch)).catch((error) => {
       logger.warn?.(`dsh-assistant: 回写设置失败: ${errorText(error)}`)
@@ -236,7 +264,10 @@ export function mountPet({ ctx, settings, eventCtx, logger = console, tuning = {
     if (!process) return false
     summarising = true
     const progressId = `summary-progress:${Date.now()}`
-    const progress = (title, detail) => send(createMessage(PetMessageKind.NOTICE, {
+    // 通知统一由 reducer 记账（postNotice）：这样它同样受条数上限约束、
+    // 同样能被 dismissNotice 清掉、换 helper 时同样会补发 —— 以前这三条直发，
+    // 宿主账本里根本没有它们
+    const progress = (title, detail) => send(postNotice({
       id: progressId,
       project: '今日总结',
       state: PetState.WORKING,
@@ -255,13 +286,11 @@ export function mountPet({ ctx, settings, eventCtx, logger = console, tuning = {
         })
         : await generateTodaySummary(ctx, { logger, digests })
 
-      // 提示词是软约束，写长了要能看见（否则只能靠肉眼发现日报越来越长）
-      const warning = reportLengthWarning(markdown)
-      if (warning) logger.warn?.(`dsh-assistant: ${warning}`)
-
+      // 长度合规只在门面里判一次（summariseWithinLimits 已经判过并会重写）；
+      // 这里再判一次会让同一条日报打两条"超出限制"日志，也没人负责收敛
       const title = `今天干了什么 · ${new Date().toLocaleDateString('zh-CN')}`
       // 先清进度条，再挂正文 + 可点击通知（点击开弹窗）
-      send(createMessage(PetMessageKind.NOTICE_CLEAR, { id: progressId, reason: 'done' }))
+      send(clearNotice(progressId, 'done'))
       // hint 是给结果页底部那行提示用的（后台总结关着时告诉用户有开关）：
       // 正文一个字都不加 —— 日报会被复制出去，提示不该混进去
       send(createMessage(PetMessageKind.SUMMARY, {
@@ -269,7 +298,7 @@ export function mountPet({ ctx, settings, eventCtx, logger = console, tuning = {
         markdown,
         hint: summaryHint(settings.get()),
       }))
-      send(createMessage(PetMessageKind.NOTICE, {
+      send(postNotice({
         id: `summary:${new Date().toDateString()}`,
         project: '今日总结',
         state: PetState.SUCCESS,
@@ -281,8 +310,8 @@ export function mountPet({ ctx, settings, eventCtx, logger = console, tuning = {
     } catch (error) {
       const detail = errorText(error)
       logger.warn?.(`dsh-assistant: 生成今日总结失败: ${detail}`)
-      send(createMessage(PetMessageKind.NOTICE_CLEAR, { id: progressId, reason: 'failed' }))
-      send(createMessage(PetMessageKind.NOTICE, {
+      send(clearNotice(progressId, 'failed'))
+      send(postNotice({
         id: `summary-error:${Date.now()}`,
         project: '今日总结',
         state: PetState.ERROR,
@@ -314,7 +343,7 @@ export function mountPet({ ctx, settings, eventCtx, logger = console, tuning = {
   const backgroundSummarise = async (session, event) => {
     if (settings.get().backgroundSummary !== true) return
     if (settings.get().enabled === false) return
-    if (session?.header?.origin === 'subagent') return
+    if (isSubagent(session)) return
     if (backgroundBusy) {
       logger.debug?.('dsh-assistant: 后台总结还在跑，这次压缩先跳过')
       return
@@ -338,7 +367,7 @@ export function mountPet({ ctx, settings, eventCtx, logger = console, tuning = {
     // 这个会话今天有新内容了 —— 下一轮总结要重读它（缓存靠这一句才敢跳读）
     digests.touch(sessionId(session))
     // 后台总结与宠物状态无关：helper 缺失时也要能攒（它服务的是"今天干了什么"）
-    if (event?.type === 'compaction/end') void backgroundSummarise(session, event)
+    if (event?.type === SessionEventKind.COMPACTION_END) void backgroundSummarise(session, event)
     if (!process || !reducer) return
     try {
       for (const message of reducer.handle(session, event)) process.send(message)
@@ -495,23 +524,12 @@ export function mountPet({ ctx, settings, eventCtx, logger = console, tuning = {
  */
 export function configMessage(resolved, settings) {
   const message = createMessage(PetMessageKind.CONFIG, {})
-  for (const field of OVERRIDABLE_FIELDS) {
+  for (const field of NATIVE_FIELDS) {
     if (settings.overridden?.(field)) message[field] = resolved[field]
   }
   return message
 }
 
-/**
- * 原生端自己也存了一份的字段（它们不该被宿主默认值覆盖）。
- *
- * 后两个（自动互动）原生端其实没有本地副本 —— 它的内置默认值与 schema 默认值相同，
- * 所以不设也一致。放进来只是为了让"只下发用户显式设过的字段"这条规则保持一致，
- * 不为它们开特例。
- */
-const OVERRIDABLE_FIELDS = Object.freeze([
-  'scale', 'bubbleEnabled', 'bubbleTheme', 'reducedMotion', 'soundEnabled',
-  'autoInteract', 'autoInteractSeconds',
-])
 
 function errorText(error) {
   return error instanceof Error ? error.message : String(error)

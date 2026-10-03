@@ -1,0 +1,32 @@
+{
+  "_comment": "配置归一化的跨语言契约：宿主 src/pet-settings.js 与原生 native/Sources/PetConfigRules.swift 必须对同一输入给出同一结果。两份测试都读这个文件：test/settings-contract.test.mjs（JS）与 native/Tests/main.swift（Swift，由 scripts/test-swift.sh 传路径）。数值用字符串表示 Inf/NaN，因为 JSON 装不下非有限值 —— 两侧都按协议的方式（Number()/Double()）解析。",
+  "scale": {
+    "default": 0.4,
+    "cases": [
+      { "input": 0.4, "expected": 0.4, "why": "默认值原样通过" },
+      { "input": 0.155, "expected": 0.16, "why": "两位四舍五入（以前原生端收 0.155）" },
+      { "input": 0.4049, "expected": 0.4, "why": "两位四舍五入" },
+      { "input": 0.4051, "expected": 0.41, "why": "进位" },
+      { "input": 0.01, "expected": 0.15, "why": "下界夹逼" },
+      { "input": 9, "expected": 2, "why": "上界夹逼" },
+      { "input": -3, "expected": 0.15, "why": "负数落到下界" },
+      { "input": "Infinity", "expected": 0.4, "why": "非有限值回默认，不是夹到上界" },
+      { "input": "-Infinity", "expected": 0.4, "why": "同上" },
+      { "input": "NaN", "expected": 0.4, "why": "同上" },
+      { "input": "0.62", "expected": 0.62, "why": "协议允许字符串数字" },
+      { "input": "abc", "expected": 0.4, "why": "解析不出来按缺失处理" }
+    ]
+  },
+  "autoInteractSeconds": {
+    "default": 10,
+    "cases": [
+      { "input": 10, "expected": 10, "why": "默认值" },
+      { "input": 37.6, "expected": 38, "why": "取整" },
+      { "input": 1, "expected": 5, "why": "下界" },
+      { "input": 9999, "expected": 300, "why": "上界" },
+      { "input": "Infinity", "expected": 10, "why": "非有限值回默认" },
+      { "input": "NaN", "expected": 10, "why": "同上" },
+      { "input": "45", "expected": 45, "why": "字符串数字" }
+    ]
+  }
+}

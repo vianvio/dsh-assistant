@@ -1,42 +1,47 @@
 /**
- * 与**真实 DSH 设置服务**的集成测试（拿不到 DSH 包时自动跳过）。
+ * 与**真实 DSH 设置服务**的集成测试。
  *
  * 为什么必须有这一条：那个"设置永远存不进去"的核心 bug，用假 provider 是测不出来的 ——
  * 旧代码 `provider.get()` / `provider.update(patch)` 在**假实现**上看起来完全正常，
  * 只有真 provider 的 `namespace` 校验会把它打回原形。
  * 所以这里直接加载机器上真实安装的 `@deepseek-ai/cordis` + `@deepseek-ai/dsh-settings`，
  * 走一遍：注册 namespace → 端点读 → 端点写 → 落盘 → 用户层判定。
+ *
+ * 包从哪找：**只认 `$DSH_HOME`**（缺省 `~/.dsh`）—— 以前第二条候选是开发机的私有目录，
+ * 那是环境状态混进了仓库。找不到依赖时不再静默 skip：见 test/helpers/coverage.mjs。
  */
 
 import assert from 'node:assert/strict'
 import { existsSync } from 'node:fs'
-import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { test } from 'node:test'
+
+import { coverageGate, dshPackagesDir } from './helpers/coverage.mjs'
+import { fakeRequest, fakeResponse } from './helpers/http.mjs'
 
 process.env.DSH_ASSISTANT_HELPER = '/nonexistent/dsh-assistant-helper'
 
 /** 找一套装好的 DSH 包（插件运行时从 profile 的 node_modules 解析它们）。 */
 function findDshPackages() {
-  const homes = [
-    process.env.DSH_HOME,
-    join(homedir(), 'Documents/projects/slf/agent-mesh/desktop/.local/dsh-home'),
-    join(homedir(), '.dsh'),
-  ].filter(Boolean)
-  for (const home of homes) {
-    for (const candidate of [join(home, 'profiles/node_modules'), join(home, 'node_modules')]) {
-      const scope = join(candidate, '@deepseek-ai')
-      if (existsSync(join(scope, 'cordis')) && existsSync(join(scope, 'dsh-settings'))) return scope
-    }
-  }
-  return undefined
+  const dir = dshPackagesDir()
+  if (!dir) return undefined
+  const scope = join(dir, '@deepseek-ai')
+  return existsSync(join(scope, 'dsh-settings')) ? scope : undefined
 }
 
 const scope = findDshPackages()
-const skip = scope ? false : '本机没有安装 @deepseek-ai/cordis + dsh-settings（插件跑在 DSH 里时才有）'
+const dshGate = coverageGate(
+  '真实 DSH 集成用例（cordis + dsh-settings）',
+  Boolean(scope),
+  'DSH_ASSISTANT_SKIP_DSH',
+  '本机没有 @deepseek-ai/cordis + @deepseek-ai/dsh-settings（装了 DSH 才有；' 
+    + `找的是 $DSH_HOME=${process.env.DSH_HOME ?? '~/.dsh'} 下的 profiles/node_modules）`,
+)
+const skip = dshGate.skip
 
 test('集成：真实 DSH 设置服务下，配置能注册、能读写、能落盘', { skip }, async () => {
+  dshGate.check()
   const { Context } = await import(pathToFileURL(join(scope, 'cordis/lib/index.js')).href)
   const { SettingsProvider } = await import(pathToFileURL(join(scope, 'dsh-settings/lib/index.js')).href)
 
@@ -78,17 +83,9 @@ test('集成：真实 DSH 设置服务下，配置能注册、能读写、能落
   assert.equal(descriptor.value.scale, 0.65, '组合配置作为 base 层生效')
 
   // ② 端点读到的就是这份配置
-  const request = (method, body) => ({
-    method,
-    url: '/plugins/dsh-assistant/config',
-    headers: { 'content-type': 'application/json' },
-    socket: { remoteAddress: '127.0.0.1' },
-    async *[Symbol.asyncIterator]() { if (body) yield Buffer.from(JSON.stringify(body)) },
-  })
-  const response = () => {
-    const state = { status: 0, body: '' }
-    return { state, writeHead(s) { state.status = s }, end(p) { state.body = p ?? '' } }
-  }
+  // 与另外两个测试文件共用同一套替身（以前这里是第三份拷贝，且已经和别人不一样了）
+  const request = (method, body) => fakeRequest({ method, body })
+  const response = fakeResponse
 
   const read = response()
   await webServer.route.handler(request('GET'), read)
@@ -122,6 +119,7 @@ test('集成：真实 DSH 设置服务下，配置能注册、能读写、能落
 })
 
 test('集成：用户层判定决定"哪些字段下发给原生端"', { skip }, async () => {
+  dshGate.check()
   const { Context } = await import(pathToFileURL(join(scope, 'cordis/lib/index.js')).href)
   const { SettingsProvider } = await import(pathToFileURL(join(scope, 'dsh-settings/lib/index.js')).href)
 
@@ -155,6 +153,7 @@ test('集成：用户层判定决定"哪些字段下发给原生端"', { skip },
 })
 
 test('集成：真 provider 上重复注册同一个 namespace 会被拒（不会静默拿错作用域）', { skip }, async () => {
+  dshGate.check()
   const { Context } = await import(pathToFileURL(join(scope, 'cordis/lib/index.js')).href)
   const { SettingsProvider } = await import(pathToFileURL(join(scope, 'dsh-settings/lib/index.js')).href)
 

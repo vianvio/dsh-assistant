@@ -1,0 +1,40 @@
+name: ci
+
+# 为什么要有它：`npm test` 以前的结果取决于开发机 $HOME 里装没装 DSH ——
+# 同一份 commit 在本机 124 pass，换一个没有 @deepseek-ai 的 HOME 就 3 条失败。
+# 有了这条工作流，"这份仓库在干净机器上是什么结论"就有了唯一答案。
+#
+# 三个门禁环境变量的含义（见 test/helpers/coverage.mjs）：
+#   DSH_ASSISTANT_SKIP_DSH=1      —— 干净 runner 上没有 DSH 的包：显式接受这 3 条集成用例不跑
+#   （原生 helper 用例不跳过：编译产物随仓库分发，macOS runner 上必须真跑）
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Node 单测 + 原生内核检查 + 端到端自检
+        env:
+          DSH_ASSISTANT_SKIP_DSH: '1'
+        run: |
+          npm test
+          npm run test:swift
+          npm run verify
+
+      - name: 确认"跳过"是被显式声明的（覆盖率下降必须留痕）
+        run: |
+          npm test 2>&1 | tee /tmp/test.log
+          if grep -q 'opt-out' /tmp/test.log; then
+            echo "::warning::本次有覆盖被显式 opt-out，见上面的 skip 清单"
+          fi

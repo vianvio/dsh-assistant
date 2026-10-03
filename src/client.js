@@ -16,10 +16,11 @@ window.__ModuleLoader__.load({
     const { useEffect, useRef, useState } = React
 
     const CONFIG_ENDPOINT = '/plugins/dsh-assistant/config'
-    const BUBBLE_THEMES = [
-      ['light', '浅色（黑字）'],
-      ['dark', '深色（白字）'],
-    ]
+    // 面板显示名与宿主契约中的 SETTINGS_DISPLAY_NAME 保持一致（由 test/settings.test.mjs 守卫）
+    const PLUGIN_LABEL = 'DSH小助手'
+    // 配色选项的**值**来自端点的字段元数据（fields.bubbleTheme.values），
+    // 这里只留显示用的中文标签（文案属于面板）
+    const BUBBLE_THEME_LABELS = { light: '浅色（黑字）', dark: '深色（白字）' }
     const ACTIONS = [
       ['pat', '摸摸头'],
       ['poke', '戳一下'],
@@ -71,6 +72,8 @@ window.__ModuleLoader__.load({
     function PetCard() {
       const [status, setStatus] = useState('loading')
       const [value, setValue] = useState({})
+      // 字段元数据（边界/默认值/枚举值）由端点下发，见 src/pet-settings.js 的 fieldMetadata()
+      const fields = value.fields ?? {}
       const [busy, setBusy] = useState(false)
       const [error, setError] = useState('')
       const [sending, setSending] = useState('')
@@ -189,12 +192,18 @@ window.__ModuleLoader__.load({
         ),
 
         React.createElement('li', null,
-          React.createElement(Field, { label: `宠物大小 ${Math.round((value.scale ?? 0.4) * 100)}%`, hint: '100% = 原始尺寸；也可以用悬浮窗右键菜单换挡' },
-            React.createElement('input', {
-              type: 'range', min: 0.15, max: 2, step: 0.05,
-              value: value.scale ?? 0.4, disabled: !writable, style: { width: 160 },
-              onChange: (event) => writeDebounced('scale', Number(event.target.value)),
-            }),
+          React.createElement(Field, {
+            label: `宠物大小 ${Math.round((value.scale ?? fields.scale?.default ?? 1) * 100)}%`,
+            hint: '100% = 原始尺寸；也可以用悬浮窗右键菜单换挡',
+          },
+            // 边界/默认值来自契约（端点的 fields），面板里不写数字
+            fields.scale
+              ? React.createElement('input', {
+                type: 'range', min: fields.scale.min, max: fields.scale.max, step: fields.scale.step,
+                value: value.scale ?? fields.scale.default, disabled: !writable, style: { width: 160 },
+                onChange: (event) => writeDebounced('scale', Number(event.target.value)),
+              })
+              : null,
           ),
         ),
 
@@ -216,8 +225,8 @@ window.__ModuleLoader__.load({
               style: { padding: '4px 8px', borderRadius: 8, minWidth: 110 },
               onChange: (event) => void write('bubbleTheme', event.target.value),
             },
-              ...BUBBLE_THEMES.map(([id, label]) =>
-                React.createElement('option', { key: id, value: id }, label)),
+              ...(fields.bubbleTheme?.values ?? []).map((id) =>
+                React.createElement('option', { key: id, value: id }, BUBBLE_THEME_LABELS[id] ?? id)),
             ),
           ),
         ),
@@ -247,16 +256,21 @@ window.__ModuleLoader__.load({
 
         React.createElement('li', null,
           React.createElement(Field, {
-            label: `自动互动间隔 ${value.autoInteractSeconds ?? 10} 秒`,
+            label: `自动互动间隔 ${value.autoInteractSeconds ?? fields.autoInteractSeconds?.default ?? 0} 秒`,
             hint: '每隔这么久掷一次 30% 的骰子；调大更安静（范围 5 – 300 秒）',
           },
-            React.createElement('input', {
-              type: 'range', min: 5, max: 300, step: 5,
-              value: value.autoInteractSeconds ?? 10,
-              disabled: !writable || value.autoInteract === false,
-              style: { width: 160 },
-              onChange: (event) => writeDebounced('autoInteractSeconds', Number(event.target.value)),
-            }),
+            fields.autoInteractSeconds
+              ? React.createElement('input', {
+                type: 'range',
+                min: fields.autoInteractSeconds.min,
+                max: fields.autoInteractSeconds.max,
+                step: fields.autoInteractSeconds.step,
+                value: value.autoInteractSeconds ?? fields.autoInteractSeconds.default,
+                disabled: !writable || value.autoInteract === false,
+                style: { width: 160 },
+                onChange: (event) => writeDebounced('autoInteractSeconds', Number(event.target.value)),
+              })
+              : null,
           ),
         ),
 
@@ -451,7 +465,7 @@ window.__ModuleLoader__.load({
         name: 'settings.section',
         id: 'dsh-assistant',
         order: 26,
-        label: () => 'DSH小助手',
+        label: () => PLUGIN_LABEL,
         inject: () => ({}),
       }, PetCard)
       try {

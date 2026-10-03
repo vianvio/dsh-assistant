@@ -15,10 +15,10 @@
 import { PetMessageKind, PetState, createMessage } from './protocol.js'
 import { SessionEventKind, isSubagent, normalize, projectName, sessionId } from './events.js'
 import { HOLD_MS, ProjectStateMachine } from './state-machine.js'
-import { noticeCopy, parallelHeadline, rosterLine, singleDetail, statusCopy } from './pet-copy.js'
+import { machineCopy, noticeCopy, parallelHeadline, rosterLine, singleDetail, stageCopy, statusCopy } from './pet-copy.js'
 
-/** 选主角的优先级：等你的最优先，其次出错，再是在干活的。 */
-const PRIORITY = Object.freeze({
+/** 选主角的优先级：等你的最优先，其次出错，再是在干活的（键必须覆盖全部状态）。 */
+export const PRIORITY = Object.freeze({
   [PetState.WAITING]: 60,
   [PetState.ERROR]: 50,
   [PetState.WORKING]: 30,
@@ -50,7 +50,16 @@ const URGENT_PRIORITY = 50
  */
 const FOCUS_DWELL_MS = 3000
 
-/** 每个项目最多挂几条通知（钉在宠物上方直到被查看）。 */
+/**
+ * 每个项目最多挂几条通知（钉在宠物上方直到被查看）。
+ *
+ * **容量与过期是两侧各管一段，靠"谁丢谁上报"对齐**（不是两边各有一份私有规则）：
+ *   · 这里的 4 是**宿主账本**的每会话上限：挤掉最旧的一条时立刻补 `notice-clear`（capacity）；
+ *   · 原生侧 `PetAnimation.maxNotices = 3` 是**全局显示**上限、`noticeTtlMs = 20min` 是兜底过期，
+ *     它丢任何一条都会回报 `interaction{action:'notice-dropped', ids}`，宿主据此清账本；
+ *   · 会话被淘汰（#evictOthers）时，它挂着的通知一起补 `notice-clear`（evicted）。
+ * 对账口径见 test/notice-reconcile.test.mjs：同一段通知流跑完，两侧"还挂着几条"必须相等。
+ */
 const MAX_NOTICES = 4
 
 /**
@@ -61,6 +70,30 @@ const MAX_NOTICES = 4
  * 而不是"它问了第几次" —— 后者会刷满通知层。
  */
 const WAITING_NOTICE_SUFFIX = ':wait'
+
+/**
+ * 通知的**唯一构造器**：生产端、探针、自检都用它。
+ *
+ * 以前探针与自检各手抄一份字面量，生产端加 `sessionId` 时它们没跟上 ——
+ * 于是"点通知切到该会话"这条真实路径在探针里永远走不到（原生端没有 sessionId
+ * 只能当成"已查看"）。字段只有一处定义就不会再漂。
+ */
+/** 状态机的语义键 → 气泡文案（领域不产出用户可见字符串，渲染在这里发生）。 */
+function machineMessage(machine) {
+  return machineCopy(machine.copy, machine.seq)
+}
+
+function machineStage(machine) {
+  return stageCopy(machine.stageKey)
+}
+
+export function noticeMessage({ id, project, state, title, detail, action, sessionId, createdAt } = {}) {
+  const payload = { id, project, state, title, detail }
+  if (action !== undefined) payload.action = action
+  if (sessionId !== undefined) payload.sessionId = sessionId
+  if (createdAt !== undefined) payload.createdAt = createdAt
+  return createMessage(PetMessageKind.NOTICE, payload)
+}
 
 export class PetReducer {
   /**
@@ -79,6 +112,16 @@ export class PetReducer {
     this.focusSinceAt = 0
     /** @type {Map<string, { machine: ProjectStateMachine, subagent: boolean, project?: string, touchedAt: number, notices: object[] }>} */
     this.projects = new Map()
+    /**
+     * 宿主自己产生的通知（日报进度/结果/失败）也进同一份账本。
+     *
+     * 以前这三条走 `send()` 直发、不进任何账本：于是它们不受条数上限约束、
+     * `dismissNotice()` 永远返回 false、换 helper 也不会补发 ——
+     * "通知由谁持有、谁清得掉"被拆成了两半。
+     */
+    this.hostNotices = []
+    /** 淘汰项目时欠下的一批清通知（由 #entry 触发，handle 开头补发） */
+    this.evictionQueue = []
     this.clock = 0
     this.lastSignature = undefined
   }
@@ -102,14 +145,15 @@ export class PetReducer {
     const subagent = isSubagent(session)
     if (subagent && !this.includeSubagents) return []
 
+    const evicted = this.#drainEvictions()
     const entry = this.#entry(session, subagent)
     entry.touchedAt = ++this.clock
     entry.project = projectName(session, event) ?? entry.project
 
     const outcome = entry.machine.consume(normalized, this.now())
-    if (!outcome.changed) return []
+    if (!outcome.changed) return [...evicted]
 
-    const messages = this.#render()
+    const messages = [...evicted, ...this.#render()]
     const isFocus = this.#focus() === entry
 
     // 工具报错：不改耐久状态，只闪一下「出问题了」，让主人立刻注意到
@@ -128,7 +172,7 @@ export class PetReducer {
       messages.push(createMessage(PetMessageKind.PULSE, {
         state: outcome.pulse.state,
         ttlMs: outcome.pulse.holdMs ?? HOLD_MS[outcome.pulse.state] ?? 2000,
-        message: entry.machine.message,
+        message: machineMessage(entry.machine),
         resumeState: PetState.IDLE,
       }))
     }
@@ -141,7 +185,7 @@ export class PetReducer {
       // 通知第二行：项目 + 当时的任务/阶段（状态机有就带上，没有就只报项目）
       const copy = noticeCopy(state, {
         project: entry.project,
-        detail: entry.machine.task ?? entry.machine.stage ?? undefined,
+        detail: entry.machine.task ?? machineStage(entry.machine),
       })
       const notice = {
         id: `${entry.machine.id}:${normalized.seq ?? this.clock}`,
@@ -154,9 +198,7 @@ export class PetReducer {
         detail: copy.detail,
         createdAt: Date.now(),
       }
-      entry.notices.push(notice)
-      if (entry.notices.length > MAX_NOTICES) entry.notices.shift()
-      messages.push(createMessage(PetMessageKind.NOTICE, notice))
+      messages.push(...this.#rememberNotice(entry, notice))
     }
 
     // 「等你确认」：也走通知层，且不看焦点。
@@ -170,7 +212,7 @@ export class PetReducer {
       && outcome.state === PetState.WAITING) {
       const copy = noticeCopy(PetState.WAITING, {
         project: entry.project,
-        detail: entry.machine.stage ?? undefined,
+        detail: machineStage(entry.machine),
       })
       const notice = {
         id: `${entry.machine.id}${WAITING_NOTICE_SUFFIX}`,
@@ -181,9 +223,7 @@ export class PetReducer {
         detail: copy.detail,
         createdAt: Date.now(),
       }
-      entry.notices.push(notice)
-      if (entry.notices.length > MAX_NOTICES) entry.notices.shift()
-      messages.push(createMessage(PetMessageKind.NOTICE, notice))
+      messages.push(...this.#rememberNotice(entry, notice))
     }
 
     // 离开 WAITING = 用户回复/批准了，或者它自己接着跑了 → 这条催办没意义了。
@@ -222,6 +262,26 @@ export class PetReducer {
     return this.#clearNotices(entry, 'opened')
   }
 
+  /**
+   * 宿主自己发一条通知（日报进度、结果、失败提示）：进同一份账本，
+   * 于是它同样受上限约束、同样能被 dismissNotice 清掉、换 helper 时同样会补发。
+   */
+  postNotice(payload) {
+    const message = noticeMessage({ createdAt: Date.now(), ...payload })
+    this.hostNotices = this.hostNotices.filter((notice) => notice.id !== message.id)
+    this.hostNotices.push(message)
+    if (this.hostNotices.length > MAX_NOTICES) this.hostNotices.shift()
+    return message
+  }
+
+  /** 清掉宿主自己发的一条（返回该发的 clear 消息；没这条就返回 undefined）。 */
+  clearNotice(id, reason = 'cleared') {
+    const before = this.hostNotices.length
+    this.hostNotices = this.hostNotices.filter((notice) => notice.id !== id)
+    if (this.hostNotices.length === before) return undefined
+    return createMessage(PetMessageKind.NOTICE_CLEAR, { id, reason })
+  }
+
   /** 用户点击了宠物上的某条通知（原生端上报）→ 清掉它。 */
   dismissNotice(id) {
     for (const entry of this.projects.values()) {
@@ -231,14 +291,30 @@ export class PetReducer {
         return true
       }
     }
-    return false
+    const before = this.hostNotices.length
+    this.hostNotices = this.hostNotices.filter((notice) => notice.id !== id)
+    return this.hostNotices.length !== before
   }
 
-  /** 当前挂着的通知（供测试/宿主查询）。 */
+  /** 当前挂着的通知（含宿主自己发的那些）。 */
   pendingNotices() {
-    const all = []
+    const all = [...this.hostNotices]
     for (const entry of this.projects.values()) all.push(...entry.notices)
     return all
+  }
+
+  /** 挂着的通知对应的**协议消息**（补发用：新 helper 起来时要把它们重放一遍）。 */
+  pendingNoticeMessages() {
+    return this.pendingNotices().map((notice) => noticeMessage({
+      id: notice.id,
+      project: notice.project,
+      state: notice.state,
+      title: notice.title,
+      detail: notice.detail,
+      action: notice.action,
+      sessionId: notice.sessionId,
+      createdAt: notice.createdAt,
+    }))
   }
 
   /** 计时器驱动：让 SUCCESS/ERROR 这类停留态到点回落（宿主每秒调一次即可）。 */
@@ -257,7 +333,9 @@ export class PetReducer {
    * `state` 被吞掉（`#render` 认为"没变化"）—— 桌面上的表现就是气泡一直空着。
    */
   snapshot() {
-    return this.#render({ force: true })
+    // 通知属于"当前该显示什么"：新 helper 是空进程，不补发就永远看不到
+    //（宿主账本里还挂着，屏幕上一条都没有）
+    return [...this.#render({ force: true }), ...this.pendingNoticeMessages()]
   }
 
   /** 当前主角项目（供宿主 / 设置面板查询）。 */
@@ -268,7 +346,7 @@ export class PetReducer {
       id: entry.machine.id,
       project: entry.project,
       state: entry.machine.state,
-      message: entry.machine.message,
+      message: machineMessage(entry.machine),
     }
   }
 
@@ -278,7 +356,7 @@ export class PetReducer {
       id: entry.machine.id,
       project: entry.project ?? '未命名',
       state: entry.machine.state,
-      message: entry.machine.message,
+      message: machineMessage(entry.machine),
       active: ACTIVE_STATES.has(entry.machine.state),
     }))
   }
@@ -311,7 +389,37 @@ export class PetReducer {
       .filter(([, entry]) => entry.machine.state === PetState.IDLE)
       .sort(([, left], [, right]) => left.touchedAt - right.touchedAt)
     const victim = idle[0] ?? others.sort(([, left], [, right]) => left.touchedAt - right.touchedAt)[0]
-    if (victim) this.projects.delete(victim[0])
+    if (!victim) return
+    // 淘汰一个会话时，它挂着的通知**必须一起清**：宿主这边账本已经没了，
+    // 原生端却还在显示，之后连清都清不掉（发 notice-clear 的名单也找不到了）
+    this.evictionQueue.push(...this.#clearNotices(victim[1], 'evicted'))
+    this.projects.delete(victim[0])
+  }
+
+  /** 取走淘汰时欠下的清通知（在 handle 开头补进消息流）。 */
+  #drainEvictions() {
+    if (this.evictionQueue.length === 0) return []
+    const queued = this.evictionQueue
+    this.evictionQueue = []
+    return queued
+  }
+
+  /**
+   * 记一条通知到账本并发出去。
+   *
+   * 关键：**超出上限被挤掉的那条要补一条 notice-clear**。
+   * 以前这里是 `push` 之后 `shift()` —— 宿主账本悄悄少一条，原生端却还挂着它
+   * （而且以后再也没有任何一条清得掉它，因为宿主已经不记得这个 id 了）。
+   * 两侧的"还挂着几条"要能对上，就必须"谁丢谁负责通知"。
+   */
+  #rememberNotice(entry, notice) {
+    entry.notices.push(notice)
+    const messages = [createMessage(PetMessageKind.NOTICE, notice)]
+    while (entry.notices.length > MAX_NOTICES) {
+      const dropped = entry.notices.shift()
+      messages.push(createMessage(PetMessageKind.NOTICE_CLEAR, { id: dropped.id, reason: 'capacity' }))
+    }
+    return messages
   }
 
   #clearNotices(entry, reason) {
@@ -409,12 +517,12 @@ export class PetReducer {
     const counts = this.#counts()
     const parallel = counts.running + counts.waiting >= 2
 
-    const headline = parallel ? parallelHeadline(counts) : machine.message
+    const headline = parallel ? parallelHeadline(counts) : machineMessage(machine)
     const detail = parallel
       ? rosterLine(this.#rosterEntries(), { max: this.rosterSize })
       : singleDetail({
         project: entry.project,
-        stage: machine.stage,
+        stage: machineStage(machine),
         progress: machine.progress,
         task: machine.task,
       })

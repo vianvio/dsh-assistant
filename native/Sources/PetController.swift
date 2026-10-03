@@ -114,7 +114,7 @@ final class PetController: NSObject {
         self.frames = FrameStore(root: root, baseSize: canvasSize.width)
 
         let saved = layout.load()
-        self.scale = saved?.scale ?? PetLayoutSnapshot.defaultScale
+        self.scale = PetConfigRules.scale(saved?.scale ?? PetLayoutSnapshot.defaultScale)
         self.bubbleEnabled = saved?.bubbleEnabled ?? true
         self.reducedMotion = saved?.reducedMotion ?? false
         self.soundEnabled = saved?.soundEnabled ?? false
@@ -264,6 +264,11 @@ final class PetController: NSObject {
         // 窗口收起来时不发：对着一个看不见的宠物演戏没有意义。
         if let auto = animation.takeAutoInteraction(), window?.panel.isVisible == true {
             emit(["kind": "interaction", "source": "auto", "action": auto])
+        }
+        // 本地过期/挤掉的通知要回报宿主，否则两边的"还挂着几条"永远对不上
+        let dropped = animation.takeDroppedNoticeIds()
+        if !dropped.isEmpty {
+            emit(["kind": "interaction", "source": "notice", "action": "notice-dropped", "ids": dropped])
         }
         var petChanged = false
         if let clip = animation.currentClip, clip.file != lastDrawnClip {
@@ -525,21 +530,22 @@ final class PetController: NSObject {
     }
 
     private func applyConfig(_ message: [String: Any]) {
-        if let value = PetProtocol.doubleValue(message["scale"]) { scale = min(2.0, max(0.15, value)) }
-        if let value = message["bubbleEnabled"] as? Bool { bubbleEnabled = value }
-        if let value = message["reducedMotion"] as? Bool {
+        // 字段白名单 + 范围/精度归一化都在 PetConfigRules 里（与 PetHeadless 共用一份，
+        // 以前两处各写一遍，同一个 scale 输入能跑出不同的值）
+        let patch = PetConfigRules.patch(from: message)
+        if let value = patch.scale { scale = value }
+        if let value = patch.bubbleEnabled { bubbleEnabled = value }
+        if let value = patch.reducedMotion {
             reducedMotion = value
             if value { frames.purge() }
         }
-        if let value = message["soundEnabled"] as? Bool { soundEnabled = value }
-        if let raw = PetProtocol.stringValue(message["bubbleTheme"]), let theme = BubbleTheme(rawValue: raw) {
+        if let value = patch.soundEnabled { soundEnabled = value }
+        if let raw = patch.bubbleTheme, let theme = BubbleTheme(rawValue: raw) {
             bubbleTheme = theme
         }
         // 自动互动：开关关掉就等价于间隔 0（内核里 <=0 即彻底关闭）
-        if let value = message["autoInteract"] as? Bool { autoInteract = value }
-        if let value = PetProtocol.doubleValue(message["autoInteractSeconds"]) {
-            autoInteractSeconds = min(300, max(5, Int(value.rounded())))
-        }
+        if let value = patch.autoInteract { autoInteract = value }
+        if let value = patch.autoInteractSeconds { autoInteractSeconds = value }
         applyAutoInteract()
         resizeWindow()
         persistLayout()
@@ -787,7 +793,7 @@ final class PetController: NSObject {
     }
 
     @objc private func changeScale(_ sender: NSMenuItem) {
-        scale = min(2.0, max(0.15, Double(sender.tag) / 100.0))
+        scale = PetConfigRules.scale(Double(sender.tag) / 100.0)
         resizeWindow()
         persistLayout()
         emitSettings(["scale": scale])

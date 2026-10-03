@@ -14,6 +14,8 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { test } from 'node:test'
+
+import { VIEWED_ENDPOINT } from '../src/pet-endpoint.js'
 import { fileURLToPath } from 'node:url'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -128,7 +130,7 @@ test('客户端：切换会话会向宿主上报"我在看这个会话"', async 
     await new Promise((done) => setTimeout(done, 0))
 
     assert.deepEqual(posted.map(([, body]) => body.sessionId), ['session-a', 'session-b'])
-    assert.equal(posted[0][0], '/plugins/dsh-assistant/config/viewed')
+    assert.equal(posted[0][0], VIEWED_ENDPOINT, '测试引用端点常量，不再手抄一份字面量')
     assert.equal(posted[0][1].sessionId, 'session-a')
   } finally {
     globalThis.fetch = originalFetch
@@ -258,11 +260,33 @@ test('客户端：拿不到 sessions 服务时安静跳过（设置页照常注�
     '没有 sessions 也要把设置页注册上')
 })
 
-test('客户端：会话 id 不等时列表项结构变化也不该炸', () => {
+test('客户端：没有 subscribe（老客户端）时安静跳过，不误报', () => {
   const module = loadClientModule()
-  // 只有 getSnapshot 没有 subscribe（老客户端）→ 直接跳过
-  const list = { getSnapshot: () => ({ current: 'x' }) }
+  const harness = fakeClientContext({ sessions: { list: { getSnapshot: () => ({ current: 'x' }) } } })
+  module.apply(harness.ctx)
+  assert.ok(harness.slots.length >= 2, '设置页照常注册')
+  harness.stop()
+})
+
+test('客户端：会话 id 不等 / 列表项结构变化时不误报、也不炸', async () => {
+  const module = loadClientModule()
+  const posted = []
+  globalThis.fetch = async (url, options) => { posted.push([url, JSON.parse(options.body)]); return { ok: true } }
+  const list = fakeSessionList({ current: 'session-a', items: [{ id: 'session-a' }] })
   const harness = fakeClientContext({ sessions: { list } })
   module.apply(harness.ctx)
-  assert.ok(harness.slots.length >= 2)
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.deepEqual(posted.map(([, body]) => body.sessionId), ['session-a'], '订阅时先报当前会话')
+
+  // ① id 真变了 → 要上报
+  list.push({ current: 'session-b', items: [{ id: 'session-b' }] })
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.deepEqual(posted.map(([, body]) => body.sessionId), ['session-a', 'session-b'])
+
+  // ② id 没变、只是列表项换了形状（少字段 / 换结构）→ 不该再上报，也不该抛
+  const before = posted.length
+  list.push({ current: 'session-b', items: [{ sessionId: 'session-b', title: '换了形状' }, 'oops', null] })
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.equal(posted.length, before, '会话没变就不该重复上报')
+  harness.stop()
 })

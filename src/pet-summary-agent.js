@@ -18,8 +18,10 @@
 
 import { randomUUID } from 'node:crypto'
 
+import { SessionEventKind, isSubagentHeader } from './events.js'
 import { createSessionDigests, projectSession } from './pet-summary-digest.js'
 import { createSessionActivityIndex, touchedToday } from './pet-summary-activity.js'
+import { eventText } from './pet-summary-corpus.js'
 
 const TIMEOUT_MS = 5 * 60 * 1000
 
@@ -67,10 +69,12 @@ export async function collectSessions(ctx, logger = console, { digests, activity
   const ids = []
   const usable = []
   let skipped = 0
+  /** 本轮真的读了几个会话（cache.reads 是实例累计值，不能当本轮读数用） */
+  let roundReads = 0
 
   for (const record of records) {
     const header = record?.header ?? record
-    if (!header?.id || header.origin === 'subagent') continue
+    if (!header?.id || isSubagentHeader(header)) continue
     const id = String(header.id)
     ids.push(id)
     if (cache.has(id) && !pending.has(id)) {
@@ -83,6 +87,7 @@ export async function collectSessions(ctx, logger = console, { digests, activity
       continue
     }
     cache.reads += 1
+    roundReads += 1
     try {
       const snapshot = await sessionQuery.readSession(id)
       const digest = projectSession(snapshot, { since })
@@ -113,10 +118,12 @@ export async function collectSessions(ctx, logger = console, { digests, activity
 
   // 标题只对"真有今天内容的会话"读：标题是锦上添花，没必要为 179 个会话各折一次语料
   const titles = await readTitles(sessionQuery, usable, logger)
-  // 留一条可查的账：首轮预筛跳了多少、实际读了多少（"日报怎么变快了"要能一眼看懂）
+  // 留一条可查的账：首轮预筛跳了多少、**这一轮**读了多少（"日报怎么变快了"要能一眼看懂）。
+  // 用本轮计数而不是 cache.reads（那个只增不减，是实例累计值 —— 第二轮明明一次都没读
+  // 日志却写着"读 2 个"，账就白记了）
   logger.debug?.(
-    `dsh-assistant: 总结扫描：读 ${cache.reads} 个（含缓存命中后的重读），`
-    + `按 mtime 预筛跳过 ${skipped} 个，缓存 ${cache.stats.size} 个会话`,
+    `dsh-assistant: 总结扫描：本轮读 ${roundReads} 个 / 预筛跳过 ${skipped} 个`
+    + `（缓存命中 ${cache.stats.size} 个会话，累计读 ${cache.reads} 次）`,
   )
   return { records, digests: cache, titleOf: (id) => titles.get(String(id)) }
 }
@@ -164,7 +171,7 @@ function defaultSelection(ctx) {
  *
  * @returns {Promise<string>} 助手最后一条文本（已 trim），空表示没产出
  */
-export async function runHiddenSession(ctx, { prompt, cwd, logger = console } = {}) {
+export async function runHiddenSession(ctx, { prompt, cwd, logger = console, timeoutMs = TIMEOUT_MS } = {}) {
   const agents = ctx?.get?.('agents')
   const sessions = ctx?.get?.('sessions')
   if (!agents) throw new Error('当前 DSH 缺少 agents 服务')
@@ -173,9 +180,25 @@ export async function runHiddenSession(ctx, { prompt, cwd, logger = console } = 
   // 超时保护：agent 回合可能因为工具/网络卡住，必须有上限，
   // 否则通知永远停在"正在整理…"，用户只能重启 DSH。
   const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(new Error('总结超时（5 分钟）')), TIMEOUT_MS)
+  // 定时器必须在 try 里创建：它以前建在 try 之外、唯一的 clearTimeout 在 finally，
+  // 于是 `agents.create` 抛错时定时器留在事件循环里（没 unref，会把宿主进程拖着不退出）
+  let timer
+  // 超时监听也要**先注册**：AbortSignal 只派发一次，create 期间就超时的话，
+  // 后注册的监听永远不会被调用 —— 于是 Promise.race 只剩永不 settle 的 whenIdle()，
+  // 正好落进"必须有上限"要防的那个场景
+  const aborted = new Promise((_, reject) => {
+    const onAbort = () => reject(controller.signal.reason ?? new Error('总结被中止'))
+    if (controller.signal.aborted) onAbort()
+    else controller.signal.addEventListener('abort', onAbort, { once: true })
+  })
+  // 它可能在 `await agents.create()` 期间就 reject（那时还没人 race 它）——
+  // 先挂一个空 catch 吞掉 unhandled rejection 警告；后面 Promise.race 照样能看到这次拒绝。
+  aborted.catch(() => {})
 
-  const handle = await agents.create({
+  let handle
+  try {
+    timer = setTimeout(() => controller.abort(new Error('总结超时（5 分钟）')), timeoutMs)
+    handle = await agents.create({
     // sessionId 是必填（brandString<SessionId>，运行时就是个字符串）
     sessionId: `assistant-review-${randomUUID()}`,
     // origin: 'subagent' —— 唯一的隐藏手段
@@ -185,20 +208,12 @@ export async function runHiddenSession(ctx, { prompt, cwd, logger = console } = 
       ...(selection.model ? { model: selection.model } : {}),
       ...(selection.reasoningEffort ? { reasoningEffort: selection.reasoningEffort } : {}),
     },
-    signal: controller.signal,
-  })
+      signal: controller.signal,
+    })
 
-  try {
     handle.agent.followup(createUserPrompt(prompt))
     logger.info?.(`dsh-assistant: 总结会话已启动（模型 ${selection.model ?? '默认'}）`)
-    await Promise.race([
-      handle.agent.whenIdle(),
-      new Promise((_, reject) => {
-        controller.signal.addEventListener('abort', () => {
-          reject(controller.signal.reason ?? new Error('总结被中止'))
-        }, { once: true })
-      }),
-    ])
+    await Promise.race([handle.agent.whenIdle(), aborted])
     // 落盘屏障：读完就 dispose，先确保事件都进持久化层
     await sessions?.flush?.(handle.agent.session)
     return lastAssistantText(handle.agent.session?.snapshotEvents?.() ?? [])
@@ -207,7 +222,7 @@ export async function runHiddenSession(ctx, { prompt, cwd, logger = console } = 
     // dispose 偶尔会在 harness 内部监听器里抛（日志出现过 agent/disposed listener threw），
     // 但会话已经拿到了结果/已经失败，这里不该让清理异常盖掉真正的结果。
     try {
-      await handle.dispose?.()
+      await handle?.dispose?.()
     } catch (error) {
       logger.warn?.(`dsh-assistant: 总结会话清理异常（忽略）: ${message(error)}`)
     }
@@ -218,21 +233,11 @@ export async function runHiddenSession(ctx, { prompt, cwd, logger = console } = 
 function lastAssistantText(events) {
   let text = ''
   for (const event of events) {
-    if (event?.type !== 'assistant/message') continue
-    const piece = eventTextOf(event)
+    if (event?.type !== SessionEventKind.ASSISTANT_MESSAGE) continue
+    const piece = eventText(event)
     if (piece) text = piece
   }
   return text.trim()
-}
-
-function eventTextOf(event) {
-  const content = event?.data?.content ?? event?.data?.message?.content
-  if (!Array.isArray(content)) return ''
-  return content
-    .filter((block) => block?.type === 'text' && typeof block.text === 'string')
-    .map((block) => block.text)
-    .join('')
-    .trim()
 }
 
 /**

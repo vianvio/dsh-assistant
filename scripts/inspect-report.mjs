@@ -86,11 +86,8 @@ function assistantText(logPath) {
     if (line.trim() === '') continue
     let event
     try { event = JSON.parse(line) } catch { continue }
-    if (event?.type !== 'assistant/message') continue
-    const content = event?.data?.content ?? event?.data?.message?.content
-    if (!Array.isArray(content)) continue
-    const text = content.filter((b) => b?.type === 'text' && typeof b.text === 'string')
-      .map((b) => b.text).join('').trim()
+    if (event?.type !== SessionEventKind.ASSISTANT_MESSAGE) continue
+    const text = eventText(event)
     if (text) last = text
   }
   return last

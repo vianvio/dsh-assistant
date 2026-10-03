@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url'
 import { PetProcess, defaultAssetRoot, defaultHelperPath, helperAvailable } from '../src/pet-process.js'
 import { PetMessageKind, PetState, createMessage } from '../src/protocol.js'
 import { interactionMessage } from '../src/pet-interactions.js'
+import { noticeMessage } from '../src/pet-reducer.js'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const noticeMode = process.argv.includes('--notice')
@@ -87,14 +88,17 @@ if (noticeMode) {
   }))
   await new Promise((done) => setTimeout(done, 600))
   console.log('→ 完成通知（与状态气泡无关的一层）')
-  process_.send(createMessage(PetMessageKind.NOTICE, {
+  // 用生产端同一个构造器：字段（尤其是 sessionId）不会再和 reducer 漂
+  process_.send(noticeMessage({
     id: 'probe:1', project: 'dsh-assistant', state: PetState.SUCCESS,
     title: '任务完成了', detail: 'dsh-assistant · 1m20s',
+    sessionId: 'probe-session-1',
   }))
   await new Promise((done) => setTimeout(done, 500))
-  process_.send(createMessage(PetMessageKind.NOTICE, {
+  process_.send(noticeMessage({
     id: 'probe:2', project: 'agent-mesh', state: PetState.ERROR,
     title: '任务出错了', detail: 'agent-mesh · 超时',
+    sessionId: 'probe-session-2',
   }))
   console.log('  两条通知已挂上；点一下通知即消失')
 }

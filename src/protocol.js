@@ -78,8 +78,17 @@ function validate(value) {
   }
   if (value.v !== PROTOCOL_VERSION) return new TypeError(`unsupported protocol version: ${String(value.v)}`)
   if (!kinds.has(value.kind)) return new TypeError(`unknown pet message kind: ${String(value.kind)}`)
-  if ((value.kind === PetMessageKind.STATE || value.kind === PetMessageKind.PULSE) && !states.has(value.state)) {
+  // 所有"带 state"的消息都要校验：STATE / PULSE 决定耐久状态与脉冲，
+  // NOTICE 决定原生端画哪个图标、PULSE.resumeState 决定脉冲结束后回到哪儿。
+  // 以前只校验前两个 —— NOTICE 传个拼错的状态会一路走到原生端，
+  // 在 `PetState(rawValue:) ?? .success` 那里静默变成"成功"。
+  if ((value.kind === PetMessageKind.STATE
+      || value.kind === PetMessageKind.PULSE
+      || value.kind === PetMessageKind.NOTICE) && !states.has(value.state)) {
     return new TypeError(`unknown pet state: ${String(value.state)}`)
+  }
+  if (value.kind === PetMessageKind.PULSE && value.resumeState !== undefined && !states.has(value.resumeState)) {
+    return new TypeError(`unknown pet resume state: ${String(value.resumeState)}`)
   }
   // 通知必须带 id：点击/查看后的精确清除全靠它，没有 id 就清不掉，会永远挂着
   if (value.kind === PetMessageKind.NOTICE && (typeof value.id !== 'string' || value.id.length === 0)) {

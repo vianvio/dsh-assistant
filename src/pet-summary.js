@@ -18,9 +18,12 @@ import {
   extractDeltas,
   reportLengthWarning,
   reportLineCount,
+  startOfToday,
 } from './pet-summary-corpus.js'
 import { collectSessions, runHiddenSession } from './pet-summary-agent.js'
-import { appendPart, storePath, summarizedUntil } from './pet-summary-store.js'
+import { createSessionDigests } from './pet-summary-digest.js'
+import { appendPart, partsFor, storePath, summarizedUntil } from './pet-summary-store.js'
+import { SETTINGS_DISPLAY_NAME, SETTINGS_FIELDS } from './pet-settings.js'
 
 /**
  * 结果页底部那行提示：**后台总结没开**时，说明有个开关可以打开。
@@ -29,11 +32,26 @@ import { appendPart, storePath, summarizedUntil } from './pet-summary-store.js'
  * 那条路径，用户能感觉到的只有慢 —— 结果页不写一句，就没人知道还有另一档。
  * 反过来开着的时候**不要再念**：那是噪音，也会让人以为每次都得去点一下。
  *
- * 措辞对齐设置面板：卡片叫「桌面宠物」，开关叫「任务后台总结」。
+ * 措辞对齐设置面板：卡片名与开关名都从**设置契约**里取（见 pet-settings.js），
+ * 不再手抄成字符串 —— 面板改名时这里的提示会跟着变，或者被
+ * test/summary.test.mjs 的守卫顶红。
  */
+/**
+ * 建一份会话扫描缓存。
+ *
+ * 为什么由门面提供：摘要子系统的对外接缝就是 pet-summary.js —— 编排层（pet.js）
+ * 以前直接从最底层 `pet-summary-digest.js` 拿 `createSessionDigests()`，
+ * 于是"这份缓存的生命周期与策略"落在了编排层，门面反而只能被动接受注入。
+ */
+export function createDigestCache(options) {
+  return createSessionDigests(options)
+}
+
 export function summaryHint({ backgroundSummary } = {}) {
   if (backgroundSummary === true) return ''
-  return '这次是全量重读今天的所有会话。在「设置 → 桌面宠物」里打开「任务后台总结」后，'
+  const card = SETTINGS_DISPLAY_NAME
+  const toggle = SETTINGS_FIELDS.backgroundSummary.label
+  return `这次是全量重读今天的所有会话。在「设置 → ${card}」里打开「${toggle}」后，`
     + '每次会话压缩会顺手提炼并留存，「今日总结」只补最后没压缩的增量：更快、更省，'
     + '多个会话也不会互相干扰。'
 }
@@ -102,17 +120,42 @@ export async function refinePendingParts(ctx, {
   }
   if (parts.length === 0) throw new Error('所有会话都没提炼出内容')
 
-  // 落盘：下次只取这些水位之后的新增部分（失败也不要紧，最多是下次多提炼一遍）
+  // 落盘：下次只取这些水位之后的新增部分。
+  // **每个会话各自 try/catch** —— 这句注释一直写着"失败也不要紧，最多是下次多提炼一遍"，
+  // 但以前没有 catch：另一个进程正好在写（或目录不可写）时抛出的 ENOENT/EEXIST 会
+  // 一路冒到 pet.js 的 catch，把**已经提炼好的整份日报**一起废掉。
   for (const part of parts) {
-    appendPart({
-      sessionId: part.id,
-      title: part.title,
-      cwd: part.cwd,
-      untilTime: part.untilTime,
-      markdown: part.markdown,
-    }, storeFile)
+    try {
+      appendPart({
+        sessionId: part.id,
+        title: part.title,
+        cwd: part.cwd,
+        untilTime: part.untilTime,
+        markdown: part.markdown,
+      }, storeFile)
+    } catch (error) {
+      logger.warn?.(
+        `dsh-assistant: 水位落盘失败（不影响本次日报）: ${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
   }
-  return { parts, sessions: parts.length, fallbackCwd, date: dateOf(now) }
+  // 今天的**全部**片段 = 磁盘上留存的（今天那份）+ 本轮增量。
+  // 以前只把本轮增量交出去，于是"上午压缩过的那段"进了库却永远不进汇总提示词 ——
+  // 增量模式的日报只覆盖最后一次压缩之后的内容（store 里明明存着）。
+  const since = startOfToday(now)
+  const todayParts = []
+  for (const part of parts) {
+    const stored = partsFor(part.id, storeFile).filter((entry) => entry.untilTime >= since)
+    const merged = new Map(stored.map((entry) => [entry.untilTime, entry]))
+    merged.set(part.untilTime, {
+      untilTime: part.untilTime, markdown: part.markdown, ts: Date.now(), title: part.title,
+    })
+    for (const entry of [...merged.values()].sort((left, right) => left.untilTime - right.untilTime)) {
+      todayParts.push({ id: part.id, title: part.title, cwd: part.cwd, ...entry })
+    }
+  }
+
+  return { parts, todayParts, sessions: parts.length, fallbackCwd, date: dateOf(now) }
 }
 
 /**
@@ -123,10 +166,12 @@ export async function refinePendingParts(ctx, {
  * @returns {Promise<{ markdown: string, parts: object[], sessions: number }>}
  */
 export async function generateTodaySummaryStepped(ctx, { logger = console, ...options } = {}) {
-  const { parts, sessions, fallbackCwd, date } = await refinePendingParts(ctx, { logger, ...options })
+  const { parts, todayParts, sessions, fallbackCwd, date } = await refinePendingParts(ctx, { logger, ...options })
 
+  // 汇总提示词吃的是"今天的全部片段"（留存 + 增量），不是只有本轮提炼出来的那几段
+  const merged = todayParts?.length ? todayParts : parts
   const markdown = await summariseWithinLimits(ctx, {
-    prompt: buildMergePrompt(parts, { date }),
+    prompt: buildMergePrompt(merged, { date }),
     cwd: fallbackCwd,
     date,
     logger,

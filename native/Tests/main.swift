@@ -605,6 +605,51 @@ do {
     }
 }
 
+
+// 10) 配置归一化：与宿主 src/pet-settings.js 对同一份 fixture 给出同一结果
+do {
+    let fixturePath = ProcessInfo.processInfo.environment["DSH_ASSISTANT_CONFIG_FIXTURE"]
+    if fixturePath == nil || !FileManager.default.fileExists(atPath: fixturePath!) {
+        check(false, "配置归一化契约：找不到 fixture（DSH_ASSISTANT_CONFIG_FIXTURE）", detail: fixturePath ?? "nil")
+    } else if let data = FileManager.default.contents(atPath: fixturePath!),
+              let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
+        check(true, "配置归一化契约：读到宿主那份 fixture")
+
+        func number(_ raw: Any) -> Double? {
+            if let n = raw as? NSNumber { return n.doubleValue }
+            if let text = raw as? String { return Double(text) }
+            return nil
+        }
+
+        let scaleSpec = root["scale"] as? [String: Any] ?? [:]
+        let scaleDefault = number(scaleSpec["default"] ?? 0.4) ?? 0.4
+        var scaleBad: [String] = []
+        for item in (scaleSpec["cases"] as? [[String: Any]]) ?? [] {
+            let input = number(item["input"] ?? 0) ?? .nan
+            let expected = number(item["expected"] ?? 0) ?? 0
+            let actual = PetConfigRules.scale(input)
+            if abs(actual - expected) > 1e-9 { scaleBad.append("\(item["input"] ?? "?") → \(actual)（期望 \(expected)）") }
+        }
+        check(scaleBad.isEmpty, "schema 归一化：scale 的 12 个用例与宿主逐值一致", detail: scaleBad.joined(separator: "; "))
+        check(PetConfigRules.scale(.nan) == scaleDefault, "schema 归一化：scale 的 NaN 回默认（不是夹到边界）", detail: "\(PetConfigRules.scale(.nan))")
+
+        let secSpec = root["autoInteractSeconds"] as? [String: Any] ?? [:]
+        var secBad: [String] = []
+        for item in (secSpec["cases"] as? [[String: Any]]) ?? [] {
+            let input = number(item["input"] ?? 0) ?? .nan
+            let expected = Int(number(item["expected"] ?? 0) ?? 0)
+            let actual = PetConfigRules.autoInteractSeconds(input)
+            if actual != expected { secBad.append("\(item["input"] ?? "?") → \(actual)（期望 \(expected)）") }
+        }
+        check(secBad.isEmpty, "schema 归一化：autoInteractSeconds 的用例与宿主逐值一致", detail: secBad.joined(separator: "; "))
+
+        // 白名单：不在名单里的字段一个都不许进来
+        let patch = PetConfigRules.patch(from: ["scale": 0.9, "bubbleTheme": "dark", "乱写": 1, "enabled": false])
+        check(patch.scale == 0.9 && patch.bubbleTheme == "dark", "config 白名单：合法字段被收下")
+        check(!patch.isEmpty, "config 白名单：补丁非空")
+    }
+}
+
 print("")
 if failures == 0 {
     print("全部通过（\(checks) 项检查）")

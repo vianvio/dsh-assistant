@@ -10,8 +10,11 @@
  *   1. **按事件时间过滤**，不是按会话过滤。某个会话今天只是被 resume 了一下，
  *      它的昨天消息不能进报告（用户实测："今天什么都没做，报告里全是昨天的工作"）。
  *   2. 只取**真人**发的 user/message（`source.kind === 'user'`），注入的上下文丢掉。
- *   3. 排除 `origin === 'subagent'`：那是我们自己跑总结用的隐藏会话，别再喂回自己。
+ *   3. 排除子 Agent 会话：那是我们自己跑总结用的隐藏会话，别再喂回自己。
+ *      判据来自 events.js 的 isSubagentHeader（唯一一份，含 delegationDepth）。
  */
+
+import { SessionEventKind, isSubagentHeader } from './events.js'
 
 const MAX_CHARS_PER_SESSION = 12_000
 const MAX_TOTAL_CHARS = 120_000
@@ -42,18 +45,18 @@ function headerOf(record) {
 /** 这条会话要不要参与总结（id 存在、不是我们自己跑的隐藏会话）。 */
 function countable(record) {
   const header = headerOf(record)
-  return Boolean(header?.id) && header.origin !== 'subagent'
+  return Boolean(header?.id) && !isSubagentHeader(header)
 }
 
 /** 事件 → 给模型看的行（用户真人消息 + 助手文字）。 */
 export function eventsToLines(events) {
   const lines = []
   for (const event of events) {
-    if (event?.type === 'user/message') {
+    if (event?.type === SessionEventKind.USER_MESSAGE) {
       if (event?.data?.source?.kind !== 'user') continue
       const text = eventText(event)
       if (text) lines.push(`【用户】${text}`)
-    } else if (event?.type === 'assistant/message') {
+    } else if (event?.type === SessionEventKind.ASSISTANT_MESSAGE) {
       const text = eventText(event)
       if (text) lines.push(`【助手】${text}`)
     }
@@ -153,20 +156,29 @@ function truncateDelta(lines, budget = MAX_CHARS_PER_SESSION) {
   const total = lines.join('\n').length
   if (total <= budget) return { lines, dropped: 0 }
 
-  // 从后往前收，直到放不下（保留最近的部分）
+  // 从后往前收，直到放不下（保留最近的部分）。
+  // 预算里要先扣掉省略标记那一行 —— 它是**拼在结果前面**的，以前不算进预算，
+  // 于是 kept 正好卡到 11988 字符时加上标记就超了（实测 delta.chars = 12021 > 12000，
+  // 与"任何输入下 delta.chars ≤ budget"的契约相反）。
+  const markerReserve = markerOf(lines.length).length + 1
   const kept = []
   let size = 0
   for (let index = lines.length - 1; index >= 0; index -= 1) {
     const line = lines[index]
-    if (size + line.length + 1 > budget && kept.length > 0) break
+    if (size + line.length + 1 > budget - markerReserve && kept.length > 0) break
     kept.unshift(line)
     size += line.length + 1
   }
   const dropped = lines.length - kept.length
   return {
-    lines: [`…（更早的 ${dropped} 行已省略，只保留最近的部分）`, ...kept],
+    lines: [markerOf(dropped), ...kept],
     dropped,
   }
+}
+
+/** 省略标记行（预算要先按它留位置）。 */
+function markerOf(dropped) {
+  return `…（更早的 ${dropped} 行已省略，只保留最近的部分）`
 }
 
 /**

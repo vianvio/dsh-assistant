@@ -10,6 +10,7 @@ import { test } from 'node:test'
 import { PetMessageKind, PetState } from '../src/protocol.js'
 import { PetReducer } from '../src/pet-reducer.js'
 import { ProjectStateMachine, TRANSITIONS, Trigger } from '../src/state-machine.js'
+import { machineCopy, stageCopy, statusCopy } from '../src/pet-copy.js'
 import { asksUser, classifyTool, isKnownEvent, normalize, projectName, sessionId, turnEndKind } from '../src/events.js'
 
 function session(id = 's1', origin = 'human') {
@@ -348,9 +349,26 @@ test('状态机：回到 THINKING 时阶段标签跟着回落', () => {
   machine.consume({ kind: 'tool/call', seq: 2, tool: 'bash', callId: 'c', asksUser: false }, 0)
   machine.consume({ kind: 'tool/result', seq: 3, callId: 'c' }, 0)
   assert.equal(machine.state, PetState.THINKING)
-  assert.equal(machine.stage, '整理阶段')
+  // 领域层只产出**语义键**，中文由展示层渲染（stageCopy）—— 所以这里断言键
+  assert.equal(machine.stageKey, 'wrapping')
+  assert.equal(stageCopy(machine.stageKey), '整理阶段')
   machine.consume({ kind: 'assistant/chunk', seq: 4 }, 0)
-  assert.equal(machine.stage, '分析阶段', 'THINKING 阶段不该一直挂着旧阶段名')
+  assert.equal(machine.stageKey, 'analyzing', 'THINKING 阶段不该一直挂着旧阶段名')
+  assert.equal(stageCopy(machine.stageKey), '分析阶段')
+})
+
+test('领域层不产出用户可见文案（依赖方向是"文案依赖领域"）', async () => {
+  const { readFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  for (const file of ['src/state-machine.js']) {
+    const source = readFileSync(join(process.cwd(), file), 'utf8')
+    assert.ok(!source.includes('pet-copy.js'), `${file} 不该 import 文案层`)
+    assert.ok(!/阶段'|待机'/.test(source), `${file} 里不该再硬编码中文文案`)
+  }
+  // 机器给的是键，渲染器给的是句子
+  assert.equal(machineCopy({ group: 'thinking' }, 0), machineCopy({ group: 'thinking' }, 0))
+  assert.ok(machineCopy({ activity: 'SEARCHING' }, 0).length > 0)
+  assert.equal(stageCopy('unknown-key'), '处理阶段')
 })
 
 /* ---------------------------------------------------------- 完成通知 */
@@ -492,4 +510,59 @@ test('等待通知：离开等待就撤，且不误伤同会话的完成通知',
   const replied = reducer.handle(a, { type: 'user/message', seq: 9 })
   assert.ok(replied.some((message) => message.kind === 'notice-clear'), '回复后等待通知撤掉')
   assert.equal(reducer.pendingNotices().length, 0)
+})
+
+test('通知账本：宿主自己发的通知也进账本（能清、能补发、受上限约束）', () => {
+  const reducer = new PetReducer()
+  const posted = reducer.postNotice({
+    id: 'summary-progress:1', project: '今日总结', state: PetState.WORKING,
+    title: '正在整理今天的对话…', detail: '生成完会在这里提示',
+  })
+  assert.equal(posted.kind, 'notice')
+  assert.equal(reducer.pendingNotices().length, 1, '宿主通知要出现在账本里')
+  assert.equal(reducer.dismissNotice('summary-progress:1'), true, '宿主通知也要清得掉（以前永远 false）')
+
+  // 进度条 → 结果：clearNotice 返回该发的清消息
+  reducer.postNotice({ id: 'p1', project: '今日总结', state: PetState.WORKING, title: 'a', detail: '' })
+  const cleared = reducer.clearNotice('p1', 'done')
+  assert.equal(cleared.kind, 'notice-clear')
+  assert.equal(cleared.reason, 'done')
+  assert.equal(reducer.clearNotice('p1', 'done'), undefined, '已经没了就不该再发一条清')
+
+  // 上限：宿主通知也不能无限堆
+  for (let index = 0; index < 8; index += 1) {
+    reducer.postNotice({ id: `host:${index}`, project: '今日总结', state: PetState.SUCCESS, title: 't', detail: '' })
+  }
+  assert.ok(reducer.pendingNotices().length <= 4, `实际 ${reducer.pendingNotices().length}`)
+})
+
+test('通知补发：换 helper 时快照必须带上还挂着的通知', () => {
+  const reducer = new PetReducer()
+  const a = session('a')
+  reducer.handle(a, { type: 'turn/start', seq: 1 })
+  reducer.handle(a, { type: 'turn/end', seq: 2, data: { reason: { kind: 'completed' } } })
+  reducer.postNotice({ id: 'host:1', project: '今日总结', state: PetState.SUCCESS, title: 't', detail: '' })
+
+  const snapshot = reducer.snapshot()
+  const notices = snapshot.filter((message) => message.kind === 'notice')
+  assert.equal(notices.length, 2, `快照里应带上两条挂着的通知，实际 ${notices.length}`)
+  assert.ok(notices.every((notice) => typeof notice.id === 'string' && notice.id.length > 0))
+  assert.ok(snapshot.some((message) => message.kind === 'state'), '状态照旧要补')
+})
+
+test('通知：会话被淘汰时，它挂着的通知一起清（原生端不会留着孤儿通知）', () => {
+  const reducer = new PetReducer({ maxSessions: 3 })
+  const messages = []
+  for (let index = 0; index < 6; index += 1) {
+    const s = session(`s${index}`)
+    reducer.handle(s, { type: 'turn/start', seq: 1 })
+    messages.push(...reducer.handle(s, { type: 'turn/end', seq: 2, data: { reason: { kind: 'completed' } } }))
+  }
+  const clears = messages.filter((message) => message.kind === 'notice-clear')
+  assert.ok(clears.some((clear) => clear.reason === 'evicted'), '淘汰会话要补 notice-clear')
+  // 账本里不该留下"已淘汰会话"的通知
+  for (const notice of reducer.pendingNotices()) {
+    assert.ok(reducer.projects.has(notice.sessionId) || notice.project === '今日总结',
+      `孤儿通知：${notice.id}（会话 ${notice.sessionId} 已不在账本里）`)
+  }
 })

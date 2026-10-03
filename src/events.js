@@ -36,6 +36,8 @@ export const SessionEventKind = Object.freeze({
   APPROVAL_DECIDED: 'approval/decided',
   USER_MESSAGE: 'user/message',
   TURN_END: 'turn/end',
+  /** 会话压缩结束：宿主据此触发后台提炼（先前这个类型只在用法侧裸写，枚举里没有） */
+  COMPACTION_END: 'compaction/end',
 })
 
 /** 回合结束的原因（DSH 用 `data.reason.kind` 表达）。 */
@@ -137,9 +139,20 @@ export function sessionId(session) {
   return String(session?.header?.id ?? session?.id ?? 'unknown-session')
 }
 
-/** 子 Agent 会话（默认不参与宠物状态，避免抢镜头）。 */
+/**
+ * 子 Agent 会话（默认不参与宠物状态，避免抢镜头）。
+ *
+ * **这是唯一一份判据**：宠物状态、后台总结、日报语料、诊断脚本都调它。
+ * 以前另外四处各自内联了更窄的 `origin === 'subagent'`，其中一处（诊断脚本）
+ * 还自称"与宿主同一套判据" —— 加一条判据要改 5 个地方，漏改是静默的。
+ */
+export function isSubagentHeader(header) {
+  return header?.origin === 'subagent' || Number(header?.delegationDepth ?? 0) > 0
+}
+
+/** 同上，入参是会话（会自己取 header）。 */
 export function isSubagent(session) {
-  return session?.header?.origin === 'subagent' || Number(session?.header?.delegationDepth ?? 0) > 0
+  return isSubagentHeader(session?.header ?? session)
 }
 
 /**

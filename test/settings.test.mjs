@@ -11,6 +11,7 @@ import { test } from 'node:test'
 
 import {
   BUBBLE_THEMES,
+  SETTINGS_FIELDS,
   PetConfig,
   WRITABLE_FIELDS,
   clampAutoInteractSeconds,
@@ -22,6 +23,8 @@ import {
 } from '../src/pet-settings.js'
 import { CONFIG_ENDPOINT, PENDING_ENDPOINT, VIEWED_ENDPOINT, createConfigHandler } from '../src/pet-endpoint.js'
 import { configMessage } from '../src/pet.js'
+import { NATIVE_FIELDS } from '../src/pet-settings.js'
+import { fakeRequest, fakeResponse } from './helpers/http.mjs'
 import { PetMessageKind } from '../src/protocol.js'
 
 /* ------------------------------------------------------------ 归一化 */
@@ -209,27 +212,6 @@ test('配置下发：自动互动的开关与间隔会送到原生端（关掉�
 
 /* ---------------------------------------------------------- 本地端点 */
 
-function fakeRequest({ method = 'GET', address = '127.0.0.1', body, headers = {}, url = CONFIG_ENDPOINT } = {}) {
-  const chunks = body === undefined ? [] : [Buffer.from(JSON.stringify(body))]
-  return {
-    method,
-    url,
-    headers,
-    socket: { remoteAddress: address },
-    async *[Symbol.asyncIterator]() {
-      for (const chunk of chunks) yield chunk
-    },
-  }
-}
-
-function fakeResponse() {
-  const state = { status: 0, body: '' }
-  return {
-    state,
-    writeHead(status) { state.status = status },
-    end(payload) { state.body = payload ?? '' },
-  }
-}
 
 test('设置端点：GET/PATCH 正常，未知字段被拒', async () => {
   const settings = createMemoryScope(defaults)
@@ -279,6 +261,35 @@ test('设置端点：非回环 / 跨源 / 未知方法都被挡', async () => {
   const sameOrigin = fakeResponse()
   await handler(fakeRequest({ headers: { origin: 'http://127.0.0.1:43120', host: '127.0.0.1:43120' } }), sameOrigin)
   assert.equal(sameOrigin.state.status, 200)
+
+  // DNS rebinding：Host 与 Origin 都是攻击者域名 —— 两个值都来自请求方，
+  // "Origin.host === Host" 这种自参照判定在这里恒成立（旧实现能读能写）
+  const rebindingGet = fakeResponse()
+  await handler(fakeRequest({ headers: { origin: 'http://evil.example', host: 'evil.example' } }), rebindingGet)
+  assert.equal(rebindingGet.state.status, 403, 'rebinding 读必须被挡')
+
+  const rebindingPatch = fakeResponse()
+  await handler(fakeRequest({
+    method: 'PATCH',
+    headers: { origin: 'http://evil.example', host: 'evil.example', 'content-type': 'application/json' },
+    body: { scale: 1.9 },
+  }), rebindingPatch)
+  assert.equal(rebindingPatch.state.status, 403, 'rebinding 写必须被挡')
+
+  // 解析到回环的域名（nip.io 这类）同样是攻击者可控的名字
+  const nipIo = fakeResponse()
+  await handler(fakeRequest({ headers: { origin: 'http://127.0.0.1.nip.io:43120', host: '127.0.0.1.nip.io:43120' } }), nipIo)
+  assert.equal(nipIo.state.status, 403, '换成域名也要挡')
+
+  // 同一个回环地址上的**另一个端口**不算同源
+  const otherPort = fakeResponse()
+  await handler(fakeRequest({ headers: { origin: 'http://127.0.0.1:9999', host: '127.0.0.1:43120' } }), otherPort)
+  assert.equal(otherPort.state.status, 403, '端口不同不算同源')
+
+  // localhost 写法的同源请求要放行（设置面板就是这么访问的）
+  const localhostOrigin = fakeResponse()
+  await handler(fakeRequest({ headers: { origin: 'http://localhost:43120', host: 'localhost:43120' } }), localhostOrigin)
+  assert.equal(localhostOrigin.state.status, 200)
 
   const wrongMethod = fakeResponse()
   await handler(fakeRequest({ method: 'DELETE' }), wrongMethod)
@@ -419,4 +430,133 @@ test('设置端点：GET 带上主角与并行名单', async () => {
   assert.equal(body.helperRunning, true)
   assert.equal(body.focus.project, 'agent-mesh')
   assert.equal(body.roster.length, 1)
+})
+
+test('设置契约：面板不再手抄任何边界（从端点字段元数据派生）', async () => {
+  const { readFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const { fieldMetadata, SETTINGS_FIELDS } = await import('../src/pet-settings.js')
+  const source = readFileSync(join(process.cwd(), 'src/client.js'), 'utf8')
+
+  // ① 面板里不许出现 range 的数字边界（以前抄了 min: 0.15, max: 2, step: 0.05 和 min: 5, max: 300, step: 5）
+  const hardCoded = [...source.matchAll(/type: 'range'[^}]*?\b(min|max|step):\s*([\d.]+)/gu)].map((m) => m[0])
+  assert.deepEqual(hardCoded, [], `面板里还在手抄滑杆边界：${hardCoded.join(' / ')}`)
+
+  // ② 滑杆的边界必须真的取自端点下发的 fields
+  assert.ok(source.includes('min: fields.'), '滑杆的 min 要从 fields 取')
+  assert.ok(source.includes('max: fields.'), '滑杆的 max 要从 fields 取')
+  assert.ok(source.includes('step: fields.'), '滑杆的 step 要从 fields 取')
+
+  // ③ 端点确实把这份元数据发出去了（而且默认值/边界与契约一致）
+  const fields = fieldMetadata()
+  assert.equal(fields.scale.min, SETTINGS_FIELDS.scale.min)
+  assert.equal(fields.scale.max, SETTINGS_FIELDS.scale.max)
+  assert.equal(fields.scale.step, SETTINGS_FIELDS.scale.step)
+  assert.equal(fields.autoInteractSeconds.max, SETTINGS_FIELDS.autoInteractSeconds.max)
+  assert.deepEqual(fields.bubbleTheme.values, [...SETTINGS_FIELDS.bubbleTheme.values])
+
+  // ④ 面板提到的字段名都在契约里（改名字会红）
+  for (const name of Object.keys(SETTINGS_FIELDS)) {
+    assert.ok(source.includes(name), `面板里没提到字段 ${name}`)
+  }
+})
+
+test('设置契约：字段清单只有一处（可写 / 下发 / 原生回写都从契约派生）', async () => {
+  const { readFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const pet = readFileSync(join(process.cwd(), 'src/pet.js'), 'utf8')
+
+  // 原生回写不再手写 if 链：它必须遍历 WRITABLE_FIELDS
+  assert.match(pet, /for \(const field of WRITABLE_FIELDS\)/, 'handleNativeSettings 要从契约派生')
+  // 下发清单也不再手写：用契约里 native 标记派生的 NATIVE_FIELDS
+  assert.match(pet, /for \(const field of NATIVE_FIELDS\)/, 'configMessage 要用派生的下发清单')
+  // 注意：注释里可能还在提这个名字（讲历史），所以只禁"定义"
+  assert.ok(!/(?:const|let|var)\s+OVERRIDABLE_FIELDS/.test(pet), '那份手写的下发清单已经删掉了')
+  for (const field of NATIVE_FIELDS) {
+    assert.ok(WRITABLE_FIELDS.includes(field), `下发清单里的 ${field} 不在可写字段里`)
+  }
+  for (const internal of ['enabled', 'includeSubagents', 'backgroundSummary']) {
+    assert.ok(!NATIVE_FIELDS.includes(internal), `${internal} 是宿主内部字段，不该下发给原生端`)
+  }
+})
+
+test('设置契约：面板显示名与开关名在提示文案里同源（改名会被顶红）', async () => {
+  const { readFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const { summaryHint } = await import('../src/pet-summary.js')
+  const { SETTINGS_DISPLAY_NAME, SETTINGS_FIELDS } = await import('../src/pet-settings.js')
+
+  const hint = summaryHint({ backgroundSummary: false })
+  assert.ok(hint.includes(SETTINGS_DISPLAY_NAME), '提示里的卡片名要来自契约')
+  assert.ok(hint.includes(SETTINGS_FIELDS.backgroundSummary.label), '提示里的开关名要来自契约')
+  assert.equal(summaryHint({ backgroundSummary: true }), '', '开着的时候不念')
+
+  // 面板自己也得用同一个名字（它是浏览器 bundle，只能手抄一份 —— 这条守着那份）
+  const client = readFileSync(join(process.cwd(), 'src', 'client.js'), 'utf8')
+  assert.ok(client.includes(`'${SETTINGS_DISPLAY_NAME}'`), '面板显示名要与契约一致')
+})
+
+test('设置契约：端点的路径字面量只有一处（面板那份由这条守着）', async () => {
+  const { readFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const { CONFIG_ENDPOINT, VIEWED_ENDPOINT, PENDING_ENDPOINT } = await import('../src/pet-endpoint.js')
+
+  // 面板是浏览器 bundle，没法 import 宿主模块 —— 它的那份只能靠守卫不许漂
+  const client = readFileSync(join(process.cwd(), 'src', 'client.js'), 'utf8')
+  const literal = new RegExp(`CONFIG_ENDPOINT\\s*=\\s*'${CONFIG_ENDPOINT}'`, 'u')
+  assert.match(client, literal, '面板里的端点字面量必须与 pet-endpoint 导出的常量一致')
+
+  // 测试自己也别手抄
+  for (const file of ['test/client.test.mjs', 'test/settings.test.mjs', 'test/dsh-integration.test.mjs']) {
+    const source = readFileSync(join(process.cwd(), file), 'utf8')
+    const handWritten = source.match(new RegExp(`'${CONFIG_ENDPOINT}(/[a-z]+)?'`, 'gu')) ?? []
+    assert.deepEqual(handWritten, [], `${file} 里手抄了端点字面量：${handWritten.join(', ')}`)
+  }
+  assert.equal(VIEWED_ENDPOINT, `${CONFIG_ENDPOINT}/viewed`)
+  assert.equal(PENDING_ENDPOINT, `${CONFIG_ENDPOINT}/pending`)
+})
+
+test('设置：provider 在位但拿不到 schemastery 时，仍然走服务存储（不静默退回内存）', async () => {
+  const { createSettingsScope, fallbackSchema, publicConfig } = await import('../src/pet-settings.js')
+  const { configMessage } = await import('../src/pet.js')
+
+  // 与真服务同形的假 provider：只要求 schema 是**可调用的**（dsh-settings 的 resolve 就是 schema(raw)）
+  const state = { scale: 1.4 }
+  const provider = {
+    register(ns, schema, options) {
+      const resolved = () => ({ ...(options.base ?? {}), ...state })
+      return {
+        get: () => schema(resolved()),
+        update: async (patch) => { Object.assign(state, patch) },
+        watch: () => () => {},
+      }
+    },
+    describe: () => [{ ns: 'dsh-assistant', user: { ...state } }],
+  }
+
+  const scope = createSettingsScope({}, {}, { debug() {}, warn() {} }, { provider, schema: fallbackSchema })
+  assert.equal(scope.source, 'service', 'provider 在位就该走服务存储')
+  assert.equal(scope.get().scale, 1.4, '用户存过的值要读回来（以前整条服务分支被跳过，用户设置被丢弃）')
+  assert.equal(scope.overridden('scale'), true)
+
+  // 写进去要落回 provider（而不是只改内存）
+  await scope.update({ bubbleTheme: 'dark' })
+  assert.equal(state.bubbleTheme, 'dark', '改动要落进 provider')
+  const message = configMessage(scope.get(), scope)
+  assert.equal(message.bubbleTheme, 'dark')
+  assert.equal(publicConfig(fallbackSchema({ scale: 0.155 })).scale, 0.16, '兜底 schema 走同一套归一化')
+})
+
+test('通知对账：原生上报"我这边丢了这些通知"时，宿主账本跟着清', async () => {
+  const { PetReducer } = await import('../src/pet-reducer.js')
+  const reducer = new PetReducer()
+  const a = { id: 'session-a', cwd: '/tmp/project-a', title: '项目A' }
+  reducer.handle(a, { type: 'turn/start', seq: 1 })
+  reducer.handle(a, { type: 'turn/end', seq: 2, data: { reason: { kind: 'completed' } } })
+  assert.equal(reducer.pendingNotices().length, 1)
+
+  // pet.js 收到原生上报后逐个 dismissNotice —— 这里直接验证 reducer 侧的效果
+  const dropped = reducer.pendingNotices().map((notice) => notice.id)
+  for (const id of dropped) assert.equal(reducer.dismissNotice(id), true)
+  assert.equal(reducer.pendingNotices().length, 0, '宿主账本要跟着清，否则两边"还挂着几条"永远对不上')
 })

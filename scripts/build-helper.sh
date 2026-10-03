@@ -73,4 +73,9 @@ plutil -lint "$APP/Contents/Info.plist" >/dev/null
 codesign --force --deep --sign - --timestamp=none "$APP"
 codesign --verify --deep --strict "$APP"
 
+# 预热：刚签出来的二进制首次 exec 会被系统扫描（本机实测 166 秒，之后 ~20ms）。
+# 不预热的话紧接着的 `npm run verify` / `npm test` 会把它当成"协议超时"，
+# 故障指向产品而其实是冷启动。代价放在这里付。
+node "$DIR/warm-helper.mjs" "$BIN" || true
+
 echo "[build-helper] 完成：$APP"

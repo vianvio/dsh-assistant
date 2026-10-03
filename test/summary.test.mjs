@@ -536,7 +536,7 @@ test('结果页提示：后台总结关着（默认）时给一行开关说明�
   const off = summaryHint({ backgroundSummary: false })
   assert.ok(off.length > 0, '默认是这个状态，结果页必须有一句说明')
   assert.match(off, /任务后台总结/, '要点名那个开关叫什么')
-  assert.match(off, /桌面宠物/, '要说清它在设置面板的哪张卡里')
+  assert.match(off, /DSH小助手/, '要说清它在设置面板的哪张卡里（名字来自设置契约）')
   assert.match(off, /压缩/, '要说明开关打开后是靠"每次压缩顺手留存"')
 
   assert.equal(summaryHint({ backgroundSummary: true }), '', '开着就别再念（噪音）')
@@ -671,4 +671,132 @@ test('执行层：跑完隐藏会话必须 dispose，并先落盘', async () => 
 test('执行层：缺服务时给出可读的错误', async () => {
   await assert.rejects(() => collectSessions({ get: () => undefined }, quiet), /缺少 sessionQuery \/ agents/)
   await assert.rejects(() => runHiddenSession({ get: () => undefined }, { prompt: 'x' }), /缺少 agents 服务/)
+})
+
+test('增量：水位落盘失败不影响本次日报（提炼好的正文必须留下来）', async () => {
+  const { mkdtempSync, writeFileSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { refinePendingParts } = await import('../src/pet-summary.js')
+
+  const now = Date.now()
+  const dir = mkdtempSync(join(tmpdir(), 'summary-store-fail-'))
+  // 父目录是**普通文件**：mkdirSync(dirname) 必然失败 —— 模拟真实会遇到的
+  // "另一个进程正在写 / 目录不可写 / 临时文件被抢"
+  const blocker = join(dir, 'blocker')
+  writeFileSync(blocker, 'not a directory')
+  const storeFile = join(blocker, 'summaries.json')
+
+  const records = [{ header: { id: 'a', createdAt: now - 3600_000, cwd: '/p/a' } }]
+  const snapshots = new Map([['a', { events: [
+    { type: 'user/message', time: now - 3600_000, data: { source: { kind: 'user' }, content: [{ type: 'text', text: '干活' }] } },
+  ] }]])
+  const { ctx } = fakeCtx({ records, snapshots, titles: new Map([['a', '项目A']]), answers: ['- 日报正文'] })
+
+  const result = await refinePendingParts(ctx, { now, storeFile, logger: { warn() {}, info() {}, debug() {} } })
+  assert.equal(result.parts.length, 1, '落盘失败不该让提炼结果消失')
+  assert.match(result.parts[0].markdown, /日报正文/)
+})
+
+test('增量：半损坏的水位文件不会让下一次总结抛错', async () => {
+  const { mkdtempSync, writeFileSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { appendPart, partsFor } = await import('../src/pet-summary-store.js')
+
+  const dir = mkdtempSync(join(tmpdir(), 'summary-store-half-'))
+  const storeFile = join(dir, 'summaries.json')
+  writeFileSync(storeFile, JSON.stringify({ version: 1, sessions: { a: { title: 'A' } } }))
+
+  assert.equal(appendPart({ sessionId: 'a', title: 'A', cwd: '/p', untilTime: 5, markdown: '- x' }, storeFile), true)
+  assert.deepEqual(partsFor('a', storeFile).map((part) => part.untilTime), [5], '缺 parts 的记录按空处理后再写')
+
+  writeFileSync(storeFile, JSON.stringify({ version: 1, sessions: { a: { title: 'A', parts: 'oops' } } }))
+  assert.equal(appendPart({ sessionId: 'a', title: 'A', cwd: '/p', untilTime: 7, markdown: '- y' }, storeFile), true)
+  assert.deepEqual(partsFor('a', storeFile).map((part) => part.untilTime), [7], 'parts 不是数组也按空处理')
+})
+
+test('执行层：agents.create 抛错时不留定时器（否则会把宿主进程拖着不退出）', async () => {
+  const { runHiddenSession } = await import('../src/pet-summary-agent.js')
+  const countTimers = () => process.getActiveResourcesInfo().filter((kind) => kind === 'Timeout').length
+  // 先跑一个"必定抛错"的 create；定时器是在它之内创建的
+  const ctx = { get: (name) => (name === 'agents' ? { async create() { throw new Error('boom') } } : undefined) }
+  const before = countTimers()
+  await assert.rejects(() => runHiddenSession(ctx, { prompt: 'x', logger: quiet, timeoutMs: 50_000 }), /boom/)
+  assert.equal(countTimers(), before, 'create 失败路径不能留下待触发的定时器')
+})
+
+test('执行层：create 期间就超时也要能结束（不能只剩永不 settle 的 whenIdle）', async () => {
+  const { runHiddenSession } = await import('../src/pet-summary-agent.js')
+  let release
+  const gate = new Promise((resolve) => { release = resolve })
+  const ctx = {
+    get: (name) => (name === 'agents' ? {
+      async create() {
+        await gate // create 在超时之后才 resolve —— 正是 aborted 监听"后注册"会漏掉的那种
+        return {
+          agent: {
+            session: { snapshotEvents: () => [] },
+            followup() {},
+            whenIdle: () => new Promise(() => {}), // 永不 settle
+          },
+          dispose: async () => {},
+        }
+      },
+    } : undefined),
+  }
+  const promise = runHiddenSession(ctx, { prompt: 'x', logger: quiet, timeoutMs: 30 })
+  setTimeout(() => release(), 80)
+  await assert.rejects(() => promise, /超时|中止/)
+})
+
+test('增量：单会话封顶在任何输入下都守住 12k（省略标记也占预算）', async () => {
+  const { extractDeltas } = await import('../src/pet-summary-corpus.js')
+  const MAX_CHARS_PER_SESSION = 12000 // 与源码里的同一条契约（值写在这里以便断言可读）
+  const now = Date.now()
+  // 构造"尾部刚好卡在预算边缘"的输入：117 行宽 100 + 1 行宽 170（报告里的复现形状）
+  const lines = []
+  for (let index = 0; index < 117; index += 1) lines.push('x'.repeat(100))
+  lines.push('y'.repeat(170))
+  const digest = {
+    messages: lines.map((text, index) => ({ role: 'user', time: now - 1000 + index, text })),
+    lastTime: now,
+  }
+  const records = [{ header: { id: 'a', createdAt: now - 3600_000, cwd: '/p/a' } }]
+  const digests = new Map([['a', digest]])
+  const deltas = extractDeltas(records, digests, { now, summarizedUntilOf: () => 0 })
+  assert.equal(deltas.length, 1)
+  assert.ok(
+    deltas[0].chars <= MAX_CHARS_PER_SESSION,
+    `delta.chars = ${deltas[0].chars} 超过 ${MAX_CHARS_PER_SESSION}`,
+  )
+})
+
+test('增量：磁盘上留存的片段也必须进汇总提示词（不是只汇总本轮增量）', async () => {
+  const { mkdtempSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { appendPart } = await import('../src/pet-summary-store.js')
+  const { generateTodaySummaryStepped } = await import('../src/pet-summary.js')
+
+  const now = Date.now()
+  const earlier = now - 3600_000
+  const dir = mkdtempSync(join(tmpdir(), 'summary-merge-stored-'))
+  const storeFile = join(dir, 'summaries.json')
+
+  // 磁盘上已经留了一段"上午"的（模拟会话压缩时后台提炼过）
+  appendPart({ sessionId: 'a', title: '会话A', cwd: '/p/a', untilTime: earlier + 1, markdown: '- 上午：做了A' }, storeFile)
+
+  // 今天又新增了一条 → 增量只覆盖"下午"
+  const records = [{ header: { id: 'a', createdAt: earlier, cwd: '/p/a' } }]
+  const snapshots = new Map([['a', { events: [
+    { type: 'user/message', time: earlier, data: { source: { kind: 'user' }, content: [{ type: 'text', text: '上午的事' }] } },
+    { type: 'user/message', time: now - 1000, data: { source: { kind: 'user' }, content: [{ type: 'text', text: '下午的事' }] } },
+  ] }]])
+  const { ctx, calls } = fakeCtx({
+    records, snapshots, titles: new Map([['a', '会话A']]),
+    answers: ['- 下午：做了B', '## 今天做了什么\n- 上午：做了A\n- 下午：做了B'],
+  })
+
+  await generateTodaySummaryStepped(ctx, { logger: quiet, now, storeFile })
+  const mergePrompt = calls.prompts.at(-1)
+  assert.match(mergePrompt, /上午：做了A/, '磁盘留存的片段必须进汇总提示词')
+  assert.match(mergePrompt, /下午：做了B/, '本轮的增量也要在')
 })

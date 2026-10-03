@@ -1,12 +1,13 @@
 /**
  * helper 子进程：启动竞态、心跳、优雅退出、自检握手。
  *
- * 真 helper 不存在时（非 macOS / 未编译）自动跳过集成用例，
- * 但"缺 helper 只告警不抛"这条必须永远成立。
+ * 真 helper 不在位时**不再静默跳过**：要么装好（仓库里本来就带了编译好的 .app），
+ * 要么显式接受覆盖下降（DSH_ASSISTANT_SKIP_NATIVE=1）。理由见 test/helpers/coverage.mjs。
+ * "缺 helper 只告警不抛"这条不依赖 helper，永远跑。
  */
 
 import assert from 'node:assert/strict'
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { resolve, dirname, join } from 'node:path'
 import { test } from 'node:test'
@@ -14,10 +15,34 @@ import { fileURLToPath } from 'node:url'
 
 import { PetMessageKind, PetState, createMessage, decodeMessage } from '../src/protocol.js'
 import { PetProcess, defaultHelperPath, helperAvailable, probeHelper, probeProtocol } from '../src/pet-process.js'
+import { coverageGate } from './helpers/coverage.mjs'
+import { warmHelper } from '../scripts/warm-helper.mjs'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const helperReady = process.platform === 'darwin' && helperAvailable()
 const quiet = { info() {}, warn() {}, error() {}, debug() {} }
+
+/**
+ * 原生用例开跑前先把 helper 预热一次。
+ *
+ * 刚构建/刚 checkout 出来的二进制首次 exec 会被系统扫描（本机实测过 166 秒），
+ * 不预热的话这三条用例会以"假 helper 未就绪"失败 —— 故障指向 PetProcess，
+ * 实际是冷启动。见 scripts/warm-helper.mjs。
+ */
+const warmed = helperReady
+  ? await warmHelper(defaultHelperPath, { quiet: true })
+  : { ok: false, reason: 'helper 不在位' }
+if (helperReady && !warmed.ok) {
+  process.stderr.write(`[process.test] helper 预热没成功：${warmed.reason}\n`)
+}
+
+/** 原生集成用例的覆盖门禁：缺 helper 时失败（或显式 opt-out），不再静默 skip。 */
+const nativeGate = coverageGate(
+  '原生 helper 集成用例（握手 / 心跳 / 协议一致性）',
+  helperReady,
+  'DSH_ASSISTANT_SKIP_NATIVE',
+  `找不到可执行的 helper（${defaultHelperPath}）；仓库自带编译产物，缺了就跑 \`npm run build:helper\``,
+)
 
 test('进程：helper 缺失时只告警、不抛异常', () => {
   const warnings = []
@@ -36,14 +61,15 @@ test('进程：未就绪时的消息按类型合并且不丢', () => {
   // 通过队列观察排队策略（这里不发真进程，只看内部账本）
   process.send(createMessage(PetMessageKind.STATE, { state: PetState.IDLE, message: 'a' }))
   process.send(createMessage(PetMessageKind.STATE, { state: PetState.WORKING, message: 'b' }))
-  process.send(createMessage(PetMessageKind.NOTICE, { id: 'n1', title: 'x' }))
-  process.send(createMessage(PetMessageKind.NOTICE, { id: 'n2', title: 'y' }))
+  process.send(createMessage(PetMessageKind.NOTICE, { id: 'n1', state: PetState.SUCCESS, title: 'x', detail: 'd' }))
+  process.send(createMessage(PetMessageKind.NOTICE, { id: 'n2', state: PetState.ERROR, title: 'y', detail: 'd' }))
   assert.equal(process.queue.size, 1, '同 kind 的 state 只留最后一条')
   assert.equal(process.pending.length, 2, '通知必须保序补发，不能合并')
   process.stop('test')
 })
 
-test('进程：握手 → 心跳 → 优雅退出（含状态下发）', { skip: !helperReady }, async () => {
+test('进程：握手 → 心跳 → 优雅退出（含状态下发）', { skip: nativeGate.skip }, async () => {
+  nativeGate.check()
   const heartbeats = []
   const process = new PetProcess({
     assetRoot: resolve(root, 'assets', 'pack'),
@@ -76,6 +102,7 @@ test('进程：写阻塞标记换进程后必须复位（否则重启也救不�
   try {
     const process_ = new PetProcess({
       helperPath: fixture.shim,
+      args: fixture.args,
       heartbeatMs: 4000,
       restartDelayMs: 30,
       env: { FAKE_HELPER_LOG: fixture.log },
@@ -118,6 +145,7 @@ test('进程：宿主自己被卡住时，不该把健康的 helper 判死', asy
   try {
     const process_ = new PetProcess({
       helperPath: fixture.shim,
+      args: fixture.args,
       heartbeatMs: 100,
       heartbeatTimeoutMs: 200,
       restartDelayMs: 30,
@@ -155,6 +183,7 @@ test('进程：每次 ready 都会通知宿主补快照（换 helper 用）', as
   try {
     const process_ = new PetProcess({
       helperPath: fixture.shim,
+      args: fixture.args,
       heartbeatMs: 4000,
       restartDelayMs: 30,
       onReady: () => readyCalls.push(Date.now()),
@@ -209,11 +238,18 @@ setTimeout(() => {
   })
 }, ${Number(readDelayMs)})
 `)
-  writeFileSync(shim, `#!/bin/sh\nexec "${process.execPath}" "${script}"\n`)
-  chmodSync(shim, 0o755)
+  // 假 helper 的"可执行文件"= 指向 node 本体的符号链接，脚本作为参数传进去
+  // （PetProcess 支持 options.args）。
+  //
+  // 以前这里是 `#!/bin/sh` 的包装脚本，靠内核解释 shebang —— 实测在新写出的文件上
+  // 首次 exec 会被系统扫描拖到 4–8 秒，三条用例于是间歇性变成"假 helper 未就绪"，
+  // 而那句断言把故障指向了 PetProcess 而不是夹具。现在 exec 的是真二进制，没有这一步。
+  symlinkSync(process.execPath, shim)
 
   return {
     shim,
+    // spawn 的时候要带上脚本路径（shim 只是 node 本体）
+    args: [script],
     log,
     received: () => (existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n').filter(Boolean) : []),
     // 子进程可能还在写日志（stop 是异步的），删不掉就重试几次，别让清理掩盖断言
@@ -221,14 +257,16 @@ setTimeout(() => {
   }
 }
 
-test('握手自检：probeHelper 能跑通 ready → pong', { skip: !helperReady }, async () => {
+test('握手自检：probeHelper 能跑通 ready → pong', { skip: nativeGate.skip }, async () => {
+  nativeGate.check()
   const result = await probeHelper(defaultHelperPath, { assetRoot: resolve(root, 'assets', 'pack'), timeoutMs: 10000 })
   assert.equal(result.ok, true, `probe 失败: ${result.reason}`)
   assert.ok(result.seen.includes(PetMessageKind.READY))
   assert.ok(result.seen.includes(PetMessageKind.PONG))
 })
 
-test('协议一致性：宿主能发的每种消息都被 helper 认下', { skip: !helperReady }, async () => {
+test('协议一致性：宿主能发的每种消息都被 helper 认下', { skip: nativeGate.skip }, async () => {
+  nativeGate.check()
   const result = await probeProtocol(defaultHelperPath, { assetRoot: resolve(root, 'assets', 'pack'), timeoutMs: 10000 })
   assert.equal(result.ok, true, `协议漂移: ${result.reason} ${JSON.stringify(result.errors)}`)
   assert.deepEqual(result.errors, [], '不该出现任何 unknown kind 回执')
@@ -236,7 +274,8 @@ test('协议一致性：宿主能发的每种消息都被 helper 认下', { skip
   assert.ok(result.seen.includes(PetMessageKind.PONG))
 })
 
-test('协议一致性：检测器真的能发现漂移（不认的 kind 会回 error）', { skip: !helperReady }, async () => {
+test('协议一致性：检测器真的能发现漂移（不认的 kind 会回 error）', { skip: nativeGate.skip }, async () => {
+  nativeGate.check()
   const { spawn } = await import('node:child_process')
   const { createInterface } = await import('node:readline')
   const { encodeMessage } = await import('../src/protocol.js')
@@ -277,3 +316,71 @@ function waitFor(predicate, timeoutMs = 5000) {
     tick()
   })
 }
+
+test('进程：helper 路径的解析规则只有一处（显式 > 环境变量 > 默认）', async () => {
+  const { resolveHelperPath, defaultHelperPath } = await import('../src/pet-process.js')
+  const original = process.env.DSH_ASSISTANT_HELPER
+  try {
+    delete process.env.DSH_ASSISTANT_HELPER
+    assert.equal(resolveHelperPath(), defaultHelperPath, '没有显式路径、没有环境变量 → 用默认')
+    assert.equal(resolveHelperPath('/tmp/explicit'), '/tmp/explicit', '显式路径最优先')
+
+    process.env.DSH_ASSISTANT_HELPER = '/tmp/from-env'
+    assert.equal(resolveHelperPath(), '/tmp/from-env', '环境变量次之')
+    assert.equal(resolveHelperPath('/tmp/explicit'), '/tmp/explicit', '显式路径仍然压过环境变量')
+  } finally {
+    if (original === undefined) delete process.env.DSH_ASSISTANT_HELPER
+    else process.env.DSH_ASSISTANT_HELPER = original
+  }
+})
+
+test('进程：显式给了 helperPath 时，环境变量不该把宠物挡在门外', async () => {
+  const { mountPet } = await import('../src/pet.js')
+  const { createMemoryScope, defaults } = await import('../src/pet-settings.js')
+  const { mkdtempSync, rmSync, writeFileSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+
+  const dir = mkdtempSync(join(tmpdir(), 'pet-explicit-helper-'))
+  const script = join(dir, 'fake-helper.mjs')
+  writeFileSync(script, 'process.stdout.write(JSON.stringify({ v: 1, kind: "ready" }) + "\\n")\nsetInterval(() => {}, 1000)\n')
+
+  const original = process.env.DSH_ASSISTANT_HELPER
+  process.env.DSH_ASSISTANT_HELPER = '/nonexistent/helper' // 环境变量指向不存在的东西
+  const listeners = new Map()
+  const quiet = { info() {}, warn() {}, error() {}, debug() {} }
+  const ctx = {
+    logger: quiet,
+    root: undefined,
+    get: () => undefined,
+    on(event, handler) {
+      const list = listeners.get(event) ?? []
+      list.push(handler)
+      listeners.set(event, list)
+      return () => {}
+    },
+    effect: (callback) => callback(),
+  }
+  ctx.root = ctx
+
+  const pet = mountPet({
+    ctx,
+    settings: createMemoryScope(defaults),
+    eventCtx: ctx,
+    logger: quiet,
+    tuning: { processOptions: { helperPath: process.execPath, args: [script], heartbeatMs: 100000 } },
+  })
+  try {
+    let running = false
+    for (let index = 0; index < 40 && !running; index += 1) {
+      await new Promise((done) => setTimeout(done, 50))
+      running = pet.isRunning
+    }
+    assert.equal(running, true, '显式 helperPath 必须生效（以前会被"按默认路径判可用"的提前返回挡掉）')
+  } finally {
+    pet.stop()
+    if (original === undefined) delete process.env.DSH_ASSISTANT_HELPER
+    else process.env.DSH_ASSISTANT_HELPER = original
+    rmSync(dir, { recursive: true, force: true, maxRetries: 5 })
+  }
+})

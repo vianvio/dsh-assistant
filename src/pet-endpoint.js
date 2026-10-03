@@ -11,7 +11,7 @@
  * 门禁：只认本机回环 + 同源（设置面板与客户端插件都是同源页面）。
  */
 
-import { WRITABLE_FIELDS } from './pet-settings.js'
+import { WRITABLE_FIELDS, fieldMetadata } from './pet-settings.js'
 
 /** 设置面板读写的本机端点（client.js 里是同一份字面量）。 */
 export const CONFIG_ENDPOINT = '/plugins/dsh-assistant/config'
@@ -78,16 +78,64 @@ function guardLocalRequest(req, res) {
     jsonResponse(res, 403, { error: 'local access only' })
     return false
   }
+  // Host 必须是地址字面量 / localhost，**不能是域名**：DNS rebinding 打进来时
+  // Host 是攻击者控制的域名（解析到 127.0.0.1），这一条直接挡掉。
+  const host = hostnameOf(req.headers?.host)
+  if (!isAddressLikeHost(host)) {
+    jsonResponse(res, 403, { error: 'host must be a local address' })
+    return false
+  }
   const origin = req.headers?.origin
   if (origin) {
-    let originHost
-    try { originHost = new URL(origin).host } catch { originHost = undefined }
-    if (!originHost || originHost !== req.headers.host) {
+    let url
+    try { url = new URL(origin) } catch { url = undefined }
+    // 以前这里比的是 `new URL(origin).host === req.headers.host` —— 两个值**都来自请求方**，
+    // rebinding 下天然相等，等于没判（Host/Origin 都填 evil.example 时能读能写）。
+    if (!url || !isAddressLikeHost(url.hostname)) {
+      jsonResponse(res, 403, { error: 'origin mismatch' })
+      return false
+    }
+    // 端口也要对得上：同一个回环地址上别的服务不该能读写这份配置
+    const originPort = url.port
+    const hostPort = portOf(req.headers?.host)
+    if (originPort && hostPort && originPort !== hostPort) {
       jsonResponse(res, 403, { error: 'origin mismatch' })
       return false
     }
   }
   return true
+}
+
+/** `127.0.0.1:8317` → `127.0.0.1`；`[::1]:8317` → `::1`。 */
+function hostnameOf(hostHeader) {
+  const text = String(hostHeader ?? '').trim().toLowerCase()
+  if (text.startsWith('[')) {
+    const end = text.indexOf(']')
+    return end > 0 ? text.slice(1, end) : text
+  }
+  const colon = text.lastIndexOf(':')
+  return colon > 0 ? text.slice(0, colon) : text
+}
+
+/** Host 头里的端口；没有就返回空串。 */
+function portOf(hostHeader) {
+  const match = /:(\d+)$/u.exec(String(hostHeader ?? '').trim())
+  return match ? match[1] : ''
+}
+
+/**
+ * 地址字面量或 `localhost` —— **域名一律不算**。
+ *
+ * `127.0.0.1.nip.io` 这种"解析到回环的域名"也要拒：它是攻击者能控制的 DNS 名字。
+ * 真正本机访问只会用 `127.0.0.1` / `[::1]` / `localhost` / 私有 IP 字面量。
+ */
+function isAddressLikeHost(host) {
+  const name = String(host ?? '').toLowerCase()
+  if (!name) return false
+  if (name === 'localhost') return true
+  if (/^\d{1,3}(\.\d{1,3}){3}$/u.test(name)) return true
+  // IPv6 字面量：只认冒号十六进制，不认域名
+  return name.includes(':') && /^[0-9a-f:]+$/u.test(name)
 }
 
 /** 只取路径部分，丢掉 query / fragment。 */
@@ -128,6 +176,8 @@ export function createConfigHandler(settings, petHandle) {
         helperRunning: handle?.isRunning === true,
         focus: handle?.focus?.(),
         roster: handle?.roster?.() ?? [],
+        // 面板的字段名/边界/默认值都从这里拿（别在浏览器侧再抄一遍）
+        fields: fieldMetadata(),
       })
       return
     }
@@ -140,7 +190,7 @@ export function createConfigHandler(settings, petHandle) {
         // 写入走的就是宿主自己那份 scope：settings.watch 会让宠物热更新，
         // 不需要端点额外推一次配置（内存兜底也实现了 watch）。
         await settings.update(patch)
-        jsonResponse(res, 200, settings.get())
+        jsonResponse(res, 200, { ...settings.get(), fields: fieldMetadata() })
       } catch (error) {
         jsonResponse(res, 400, { error: error instanceof Error ? error.message : String(error) })
       }

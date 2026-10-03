@@ -22,6 +22,7 @@
  * 所以投影窗口取"今天"就够 —— 跨天时整份缓存作废（见 #rollover）。
  */
 
+import { SessionEventKind } from './events.js'
 import { eventText, startOfToday } from './pet-summary-corpus.js'
 
 /**
@@ -43,12 +44,12 @@ export function projectSession(snapshot, { since }) {
     const time = typeof event?.time === 'number' ? event.time : undefined
     if (time !== undefined && time > lastTime) lastTime = time
     if (time === undefined || time <= since) continue
-    if (event?.type === 'user/message') {
+    if (event?.type === SessionEventKind.USER_MESSAGE) {
       // 注入的上下文（source.kind !== 'user'）不是用户打的字，不能进日报
       if (event?.data?.source?.kind !== 'user') continue
       const text = eventText(event)
       if (text) messages.push({ time, role: 'user', text })
-    } else if (event?.type === 'assistant/message') {
+    } else if (event?.type === SessionEventKind.ASSISTANT_MESSAGE) {
       const text = eventText(event)
       if (text) messages.push({ time, role: 'assistant', text })
     }

@@ -32,8 +32,7 @@
  */
 
 import { PetState } from './protocol.js'
-import { SessionEventKind, ToolActivity, TurnEndKind, classifyTool } from './events.js'
-import { activityCopy, statusCopy } from './pet-copy.js'
+import { SessionEventKind, TurnEndKind, classifyTool } from './events.js'
 
 /** 机器可见的触发事件（把 DSH 事件翻译成状态机语言）。 */
 export const Trigger = Object.freeze({
@@ -107,8 +106,18 @@ export class ProjectStateMachine {
   constructor({ id } = {}) {
     this.id = String(id ?? 'unknown-session')
     this.state = PetState.IDLE
-    this.message = statusCopy('idle')
-    this.stage = '待机'
+    /**
+     * 现在该表达什么 —— **语义键**，不是文案。
+     *
+     * `{ group }`（如 preparing / thinking / waiting）或 `{ activity }`（searching / editing…），
+     * 外加 `seq`（同一个键的多个变体用序号区分）。
+     * 文案由展示层（pet-reducer → pet-copy）渲染：依赖方向是"文案层依赖领域"，
+     * 不是领域自己产出用户可见字符串。
+     */
+    this.copy = { group: 'idle' }
+    this.seq = 0
+    /** 阶段键（同上，展示层翻成"分析阶段"这类中文）。 */
+    this.stageKey = 'idle'
     this.task = undefined
     this.progress = undefined
     this.turnActive = false
@@ -157,35 +166,37 @@ export class ProjectStateMachine {
         this.openTools.clear()
         this.task = undefined
         this.progress = undefined
-        return { message: statusCopy('preparing', seq), stage: '准备阶段' }
+        return { copy: { group: 'preparing' }, seq, stageKey: 'preparing' }
       case Trigger.STEP_PROGRESS:
         if (!this.turnActive || this.openTools.size > 0) return undefined
-        return { message: statusCopy('thinking', seq), stage: '分析阶段' }
+        return { copy: { group: 'thinking' }, seq, stageKey: 'analyzing' }
       case Trigger.TOOL_STARTED: {
         if (!this.turnActive) this.turnActive = true
         this.openTools.set(event.callId, event.tool)
         const activity = classifyTool(event.tool)
-        return { message: activityCopy(activity, seq), stage: stageOf(activity) }
+        return { copy: { activity }, seq, stageKey: activity }
       }
       case Trigger.TOOL_FINISHED: {
         if (event.callId) this.openTools.delete(event.callId)
         const remaining = [...this.openTools.values()][0]
-        return remaining
-          ? { message: activityCopy(classifyTool(remaining), seq), stage: stageOf(classifyTool(remaining)) }
-          : { message: statusCopy('result', seq), stage: '整理阶段' }
+        if (remaining) {
+          const activity = classifyTool(remaining)
+          return { copy: { activity }, seq, stageKey: activity }
+        }
+        return { copy: { group: 'result' }, seq, stageKey: 'wrapping' }
       }
       case Trigger.QUESTION_ASKED:
         this.openTools.set(event.callId, event.tool)
-        return { message: statusCopy('waiting', seq), stage: '等待确认' }
+        return { copy: { group: 'waiting' }, seq, stageKey: 'waiting' }
       case Trigger.APPROVAL_REQUESTED:
-        return { message: statusCopy('approval', seq), stage: '等待审批' }
+        return { copy: { group: 'approval' }, seq, stageKey: 'approval' }
       case Trigger.APPROVAL_RESOLVED:
       case Trigger.USER_REPLIED:
-        return { message: statusCopy('result', seq), stage: '继续执行' }
+        return { copy: { group: 'result' }, seq, stageKey: 'resuming' }
       case Trigger.TASK_UPDATED:
         this.task = event.progress?.current ?? this.task
         this.progress = event.progress ?? this.progress
-        return { stage: this.state === PetState.WORKING ? '执行阶段' : '分析阶段' }
+        return { stageKey: this.state === PetState.WORKING ? 'working' : 'analyzing' }
       case Trigger.TURN_SETTLED:
         this.turnActive = false
         this.openTools.clear()
@@ -209,12 +220,13 @@ export class ProjectStateMachine {
 
     this.state = targeted
     if (payload) {
-      this.message = payload.message ?? this.message
-      this.stage = payload.stage ?? this.stage
+      this.copy = payload.copy ?? this.copy
+      this.seq = payload.seq ?? this.seq
+      this.stageKey = payload.stageKey ?? this.stageKey
     }
     // 不变量：THINKING 阶段的标签就是「分析阶段」（除非这次迁移自带别的阶段文案），
     // 否则从 WORKING 落回 THINKING 后会一直显示旧阶段的「整理阶段」。
-    if (targeted === PetState.THINKING) this.stage = payload?.stage ?? '分析阶段'
+    if (targeted === PetState.THINKING) this.stageKey = payload?.stageKey ?? 'analyzing'
     this.#bump(now)
     return { changed: true, state: targeted, trigger, from }
   }
@@ -223,13 +235,13 @@ export class ProjectStateMachine {
     const from = this.state
     switch (result) {
       case TurnEndKind.BLOCKED:
-        this.#setState(PetState.WAITING, { message: statusCopy('waiting'), stage: '等待确认' }, now)
+        this.#setState(PetState.WAITING, { copy: { group: 'waiting' }, stageKey: 'waiting' }, now)
         return { changed: true, state: PetState.WAITING, trigger: Trigger.TURN_SETTLED, from }
       case TurnEndKind.ABORTED:
-        this.#setState(PetState.IDLE, { message: statusCopy('stopped'), stage: '已停止' }, now)
+        this.#setState(PetState.IDLE, { copy: { group: 'stopped' }, stageKey: 'stopped' }, now)
         return { changed: true, state: PetState.IDLE, trigger: Trigger.TURN_SETTLED, from }
       case TurnEndKind.COMPLETED:
-        this.#setState(PetState.SUCCESS, { message: statusCopy('success'), stage: '已完成' }, now)
+        this.#setState(PetState.SUCCESS, { copy: { group: 'success' }, stageKey: 'done' }, now)
         this.holdUntil = now + HOLD_MS[PetState.SUCCESS]
         return {
           changed: true,
@@ -241,8 +253,8 @@ export class ProjectStateMachine {
       default: {
         const limited = result === TurnEndKind.MAX_TOKENS
         this.#setState(PetState.ERROR, {
-          message: limited ? statusCopy('limit') : statusCopy('error'),
-          stage: limited ? '到达上限' : '需要处理',
+          copy: { group: limited ? 'limit' : 'error' },
+          stageKey: limited ? 'limit' : 'failed',
         }, now)
         this.holdUntil = now + HOLD_MS[PetState.ERROR]
         return {
@@ -258,8 +270,9 @@ export class ProjectStateMachine {
 
   /** 文案/进度更新，不改状态。 */
   #touch(payload, now) {
-    if (payload.message) this.message = payload.message
-    if (payload.stage) this.stage = payload.stage
+    if (payload.copy) this.copy = payload.copy
+    if (payload.seq !== undefined) this.seq = payload.seq
+    if (payload.stageKey) this.stageKey = payload.stageKey
     if (payload.task !== undefined) this.task = payload.task
     if (payload.progress !== undefined) this.progress = payload.progress
     this.#bump(now)
@@ -268,8 +281,9 @@ export class ProjectStateMachine {
 
   #setState(state, payload, now) {
     this.state = state
-    this.message = payload.message ?? this.message
-    this.stage = payload.stage ?? this.stage
+    this.copy = payload.copy ?? this.copy
+    this.seq = payload.seq ?? this.seq
+    this.stageKey = payload.stageKey ?? this.stageKey
     this.#bump(now)
   }
 
@@ -287,8 +301,8 @@ export class ProjectStateMachine {
     this.holdUntil = 0
     const remaining = [...this.openTools.values()][0]
     this.#setState(remaining ? PetState.WORKING : PetState.IDLE, remaining
-      ? { message: activityCopy(classifyTool(remaining)), stage: '执行阶段' }
-      : { message: statusCopy('idle'), stage: '待机' }, now)
+      ? { copy: { activity: classifyTool(remaining) }, stageKey: 'working' }
+      : { copy: { group: 'idle' }, stageKey: 'idle' }, now)
     return true
   }
 }
@@ -311,12 +325,3 @@ function triggerFor(event) {
   }
 }
 
-function stageOf(activity) {
-  switch (activity) {
-    case ToolActivity.SEARCHING: return '查找阶段'
-    case ToolActivity.EDITING: return '实现阶段'
-    case ToolActivity.TESTING: return '验证阶段'
-    case ToolActivity.COMMANDING: return '执行阶段'
-    default: return '处理阶段'
-  }
-}

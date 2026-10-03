@@ -17,7 +17,12 @@ enum PetState: String, CaseIterable {
     /// 素材表里读不到这个状态时退回 IDLE 底图。
     static let fallback: PetState = .idle
 
-    /// 中文名（可访问性文案用）。
+    /// 中文名（**可访问性/朗读**文案，刻意用短词）。
+    ///
+    /// 与宿主气泡文案（`src/pet-copy.js`，用长句）是**两张有意不同的表**：
+    /// 这里负责"读出来顺耳"，那里负责"看起来自然"。两者的共同约束是**都必须覆盖
+    /// 全部七个状态** —— 由 `test/vocabulary.test.mjs` 的"文案归属"用例守着，
+    /// 新增状态时两边漏一个都会红。
     var label: String {
         switch self {
         case .idle: return "待机"

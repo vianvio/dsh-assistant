@@ -14,6 +14,8 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
+import { fakeRequest, fakeResponse } from './helpers/http.mjs'
+
 // 必须在 apply() 之前设置：PetProcess 是按调用时的 env 判断 helper 是否存在的
 process.env.DSH_ASSISTANT_HELPER = '/nonexistent/dsh-assistant-helper'
 
@@ -77,25 +79,10 @@ function fakeSettings(initial = {}) {
   }
 }
 
-function request({ method = 'GET', body, address = '127.0.0.1' } = {}) {
-  const chunks = body === undefined ? [] : [Buffer.from(JSON.stringify(body))]
-  return {
-    method,
-    url: CONFIG_ENDPOINT,
-    headers: { 'content-type': 'application/json' },
-    socket: { remoteAddress: address },
-    async *[Symbol.asyncIterator]() { for (const chunk of chunks) yield chunk },
-  }
-}
-
-function response() {
-  const state = { status: 0, body: '' }
-  return {
-    state,
-    writeHead(status) { state.status = status },
-    end(payload) { state.body = payload ?? '' },
-  }
-}
+// 端点的请求/响应替身是**共享**的（test/helpers/http.mjs）：三个测试文件以前各抄一份，
+// 抄完就各自演化（这份把 url 写死、那份支持自定义），同一个动作在两个文件里行为不同。
+const request = (options) => fakeRequest({ url: CONFIG_ENDPOINT, ...options })
+const response = fakeResponse
 
 test('装配：插件声明了要用的服务与名字', () => {
   assert.equal(name, 'dsh-assistant')
@@ -289,3 +276,4 @@ test('装配：apply 两次（热重载）不会互相干扰', async () => {
   assert.equal(first.listeners.size, 0)
   assert.equal(second.listeners.size, 0)
 })
+

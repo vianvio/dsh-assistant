@@ -78,8 +78,16 @@ final class PetAnimation {
 
     /// 完成通知（最新的在最前）
     private(set) var notices: [Notice] = []
-    /// 同时最多显示几条（超出丢最旧的）
+    /// 同时最多显示几条（超出丢最旧的）。
+    ///
+    /// 与宿主的分工：宿主账本按**会话**限 4 条（`src/pet-reducer.js` 的 MAX_NOTICES），
+    /// 这里是**全局显示**上限；两边数量不必相等，但**谁丢谁上报** —— 见下面的
+    /// 丢弃记录与 `takeDroppedNoticeIds()`，宿主收到后会清掉对应账本条目。
     var maxNotices: Int = 3
+    /// 原生端本地丢掉的通知 id（过期 / 被挤出上限）。
+    /// 宿主账本必须跟着清：不然宿主以为还挂着、屏幕上早就没了，
+    /// 而且之后发的 notice-clear 也会落空。
+    private var droppedNoticeIds: [String] = []
     /// 兜底过期：用户一直没看也不会永远堆着（默认 20 分钟）。
     /// 过期按 `advance(elapsedMs:)` 的模拟时间累计，和内核其它时间逻辑同一口径
     /// （用墙钟会让测试无法驱动，也会和帧播放节奏脱钩）。
@@ -134,10 +142,19 @@ final class PetAnimation {
                               action: action, sessionId: sessionId), at: 0)
         noticeAgeMs[id] = 0
         if notices.count > maxNotices {
-            for dropped in notices.suffix(from: maxNotices) { noticeAgeMs[dropped.id] = nil }
+            for dropped in notices.suffix(from: maxNotices) {
+                noticeAgeMs[dropped.id] = nil
+                droppedNoticeIds.append(dropped.id)
+            }
             notices = Array(notices.prefix(maxNotices))
         }
         return true
+    }
+
+    /// 取走"本地丢掉的通知 id"（PetController 把它们回报给宿主）。
+    func takeDroppedNoticeIds() -> [String] {
+        defer { droppedNoticeIds = [] }
+        return droppedNoticeIds
     }
 
     /// 清除通知：给 id 清一条；给 project 清这个项目的全部；都不给就清所有。
@@ -169,6 +186,7 @@ final class PetAnimation {
         guard !expired.isEmpty else { return false }
         for id in expired { noticeAgeMs[id] = nil }
         notices.removeAll { expired.contains($0.id) }
+        droppedNoticeIds.append(contentsOf: expired)
         return true
     }
 

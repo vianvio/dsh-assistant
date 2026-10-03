@@ -102,6 +102,39 @@ function seedNumber(seed) {
 }
 
 /** 取一条稳定（同一 seq 得到同一句）的文案。 */
+/**
+ * 阶段键 → 中文（气泡第二行用）。
+ *
+ * 键由状态机产出（领域只给语义），到这里才变成用户可见的字 —— 方向是"文案依赖领域"。
+ */
+export function stageCopy(key) {
+  switch (String(key ?? '')) {
+    case 'idle': return '待机'
+    case 'preparing': return '准备阶段'
+    case 'analyzing': return '分析阶段'
+    case 'searching': return '查找阶段'
+    case 'editing': return '实现阶段'
+    case 'testing': return '验证阶段'
+    case 'commanding': return '执行阶段'
+    case 'working': return '执行阶段'
+    case 'wrapping': return '整理阶段'
+    case 'resuming': return '继续执行'
+    case 'waiting': return '等待确认'
+    case 'approval': return '等待审批'
+    case 'done': return '已完成'
+    case 'stopped': return '已停止'
+    case 'limit': return '到达上限'
+    case 'failed': return '需要处理'
+    default: return '处理阶段'
+  }
+}
+
+/** 状态机给的语义键 → 气泡第一行的句子。 */
+export function machineCopy(copy = {}, seq = 0) {
+  if (copy.activity) return activityCopy(copy.activity, seq)
+  return statusCopy(copy.group ?? 'idle', seq)
+}
+
 export function statusCopy(group, seed = 0) {
   const variants = COPY[group] ?? COPY.working
   return variants[seedNumber(seed) % variants.length]
@@ -117,7 +150,7 @@ export function activityCopy(activity, seed = 0) {
  * ------------------------------------------------------------------ */
 
 /** 状态图标：一眼看出每个项目在干什么，比文字短得多。 */
-const STATE_GLYPH = Object.freeze({
+export const STATE_GLYPH = Object.freeze({
   IDLE: '○',
   THINKING: '◐',
   WORKING: '●',
@@ -126,6 +159,14 @@ const STATE_GLYPH = Object.freeze({
   ERROR: '✕',
   DISCONNECTED: '·',
 })
+
+/**
+ * 不认识的状态用的兜底符号。
+ *
+ * 以前兜底值就是 `·` —— 和 DISCONNECTED 的图标一模一样，于是"第 8 个状态"
+ * 或者拼错的状态名在气泡上显示成"失联"，看不出哪里不对。换成一个显眼的 `?`。
+ */
+export const UNKNOWN_STATE_GLYPH = '?'
 
 /**
  * 并行时的第一行：只说「几个在跑、几个等你」。
@@ -145,7 +186,7 @@ export function parallelHeadline({ running = 0, waiting = 0 } = {}) {
 export function rosterLine(entries = [], { max = 3 } = {}) {
   const shown = entries.slice(0, max).map((entry) => {
     const name = String(entry.name ?? '未命名').slice(0, 10)
-    const glyph = STATE_GLYPH[entry.state] ?? '·'
+    const glyph = STATE_GLYPH[entry.state] ?? UNKNOWN_STATE_GLYPH
     return `${name} ${glyph}`
   })
   const rest = entries.length - shown.length
