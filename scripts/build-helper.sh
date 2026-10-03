@@ -76,6 +76,20 @@ codesign --verify --deep --strict "$APP"
 # 预热：刚签出来的二进制首次 exec 会被系统扫描（本机实测 166 秒，之后 ~20ms）。
 # 不预热的话紧接着的 `npm run verify` / `npm test` 会把它当成"协议超时"，
 # 故障指向产品而其实是冷启动。代价放在这里付。
-node "$DIR/warm-helper.mjs" "$BIN" || true
+#
+# 这里**故意不写 `|| true`**：warm-helper 自己保证"预热没成功也 exit 0"（它是加速手段，
+# 不是正确性条件，失败时它会在 stderr 写明原因），所以走到非 0 只可能是**脚本本身崩了**
+#（比如 node 找不到、脚本语法错误）。那种情况下沉默地继续构建，紧接着的 verify/test
+# 又会被冷启动打成"协议超时/未就绪"，故障照样指向产品 —— 而这里本来有唯一一条线索。
+# 现在：退出码非 0 → 明说一句，然后照常继续（不因此让构建失败）。
+set +e
+node "$DIR/warm-helper.mjs" "$BIN"
+WARM_STATUS=$?
+set -e
+if [[ "$WARM_STATUS" -ne 0 ]]; then
+  echo "[build-helper] 警告：预热脚本自身失败（退出码 $WARM_STATUS）—— 产物没问题，" >&2
+  echo "                但接下来第一次 exec 可能要等系统扫描，verify/test 可能因此超时。" >&2
+  echo "                排查：node "$DIR/warm-helper.mjs" "$BIN"" >&2
+fi
 
 echo "[build-helper] 完成：$APP"

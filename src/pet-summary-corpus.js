@@ -18,6 +18,18 @@ import { SessionEventKind, isSubagentHeader } from './events.js'
 
 const MAX_CHARS_PER_SESSION = 12_000
 const MAX_TOTAL_CHARS = 120_000
+/**
+ * 汇总提示词的两个上限。
+ *
+ * 单会话那份提炼是**模型**产出的：正常几百字，但没有硬上限 —— 一次跑飞（吐一整篇说明文）
+ * 就能把汇总提示词撑到几十万字符。以前 `buildMergePrompt` 一个字都不封顶：后果不是
+ * "日报差一点"，而是最后这一步直接超上下文失败 —— 前面 N 次模型调用全白花。
+ */
+const MAX_PART_CHARS = 4_000
+const MAX_MERGE_CHARS = 60_000
+
+/** 提示词上限（导出给测试用，别在测试里手抄数字）。 */
+export const MERGE_PROMPT_LIMITS = { perPart: MAX_PART_CHARS, total: MAX_MERGE_CHARS }
 
 /** 从会话事件里取纯文本（不依赖 @deepseek-ai/dsh-session-query，少一个依赖）。 */
 export function eventText(event) {
@@ -443,8 +455,37 @@ export function buildSessionPrompt(delta) {
   ].join('\n')
 }
 
-/** 增量模式②：汇总提示词（把各会话的提炼合并成日报）。 */
-export function buildMergePrompt(parts, { date }) {
+/**
+ * 增量模式②：汇总提示词（把各会话的提炼合并成日报）。
+ *
+ * 字数要封顶，且**每个会话都要留一份**：不能因为第一个会话的条目特别长，就把后面的挤没。
+ * 两遍分配 —— 先按人头平分，再把手短的那几个省下来的额度补给还在超的（贪心，几轮收敛）。
+ * 被截断的会话在正文里留一句说明，模型知道"这里还有内容"，不会当成"这个会话啥也没干"。
+ *
+ * @param {Array<{title: string, cwd?: string, markdown: string}>} parts
+ * @param {{date: string, logger?: object}} options
+ */
+export function buildMergePrompt(parts, { date, logger } = {}) {
+  const bodies = parts.map((part) => String(part?.markdown ?? ''))
+  const limits = allocateChars(bodies, MAX_MERGE_CHARS)
+  let truncated = 0
+  const blocks = parts.map((part, at) => {
+    const body = bodies[at]
+    const room = limits[at]
+    let text = body
+    if (body.length > room) {
+      truncated += 1
+      const cut = Math.max(1, room - 40)
+      text = `${body.slice(0, cut)}\n…（该会话条目过长，已截断 ${body.length - cut} 字）`
+    }
+    return `### ${part.title}${part.cwd ? `（${part.cwd}）` : ''}\n${text}`
+  })
+  if (truncated > 0) {
+    logger?.warn?.(
+      `dsh-assistant: ${truncated} 个会话的提炼条目过长，汇总提示词已按上限截断`
+      + `（每段上限 ${MAX_PART_CHARS} 字、总量上限 ${MAX_MERGE_CHARS} 字）`,
+    )
+  }
   return [
     `你在为一位开发者生成 ${date} 的工作日报。下面是**各会话分别提炼**出的条目（已按会话分组）。`,
     '注意：这些条目是按会话来的，同一件事可能在多个会话里各出现一次 —— **必须合并成一条**。',
@@ -456,8 +497,28 @@ export function buildMergePrompt(parts, { date }) {
     summaryRules(),
     '',
     '--- 各会话提炼 ---',
-    ...parts.map((part) => `### ${part.title}${part.cwd ? `（${part.cwd}）` : ''}\n${part.markdown}`),
+    ...blocks,
     '',
     summaryReminder(),
   ].join('\n')
+}
+
+/**
+ * 把总量预算分配到每一段：先按人头平分（每段保底 300 字），
+ * 再把手短的那几段省下的额度补给还在超的。
+ * @returns {number[]} 每段允许的字符数
+ */
+function allocateChars(bodies, total) {
+  const caps = bodies.map((body) => Math.min(body.length, MAX_PART_CHARS))
+  const limits = caps.map((size) => Math.min(size, Math.max(300, Math.floor(total / Math.max(1, bodies.length)))))
+  if (limits.reduce((sum, size) => sum + size, 0) <= total) return limits
+  for (let round = 0; round < 8; round += 1) {
+    const spare = total - limits.reduce((sum, size) => sum + size, 0)
+    const hungry = limits.map((size, at) => at).filter((at) => limits[at] < caps[at])
+    if (spare <= 0 || hungry.length === 0) break
+    const share = Math.floor(spare / hungry.length)
+    if (share <= 0) break
+    for (const at of hungry) limits[at] = Math.min(caps[at], limits[at] + share)
+  }
+  return limits
 }

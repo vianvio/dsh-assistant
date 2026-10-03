@@ -34,3 +34,6 @@ docs/motion-samples/
 
 # 注意：runtime/bin/ 里的编译产物**要进仓库**（用户选的是"开箱即用"，
 # 别人不用装 Xcode 就能跑）。所以这里刻意不忽略它。
+
+# macOS 目录元数据（finder 打开过就会冒出来；不该进仓库）
+.DS_Store

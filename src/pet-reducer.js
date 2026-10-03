@@ -64,6 +64,30 @@ const CHILD_WORK_KINDS = new Set([
 const CHILD_STALE_MS = 10 * 60 * 1000
 
 /**
+ * 每个父会话最多记多少个子会话（超出丢最旧的）。
+ * 子会话崩溃时不会有 turn/end，光靠静默过期在被刷爆时依然会先涨到很大。
+ */
+export const MAX_CHILDREN_PER_PARENT = 256
+
+/**
+ * 超出上限后**多攒一点再裁**（裁到上限）。
+ *
+ * 为什么留余量：到顶之后每来一个新子会话就排一次序（257 个键），单事件成本从
+ * 6.3µs 涨到 7.8µs；留 32 个余量之后，裁剪是每 33 次才发生一次（摊还 O(1)），
+ * 而且一次丢掉的是"最旧的 1 个"变成"最旧的 33 个"—— 反正它们都早过期了。
+ */
+const CHILD_CAP_SLACK = 32
+
+/**
+ * 同一父会话的子表最多多久整理一次（毫秒）。
+ *
+ * 为什么不是"每次事件都整理"：整理是 O(子表大小)，而 assistant/chunk 这种流式事件
+ * 每秒能来上千条 —— 每条都整理就是 O(n²)（实测 16000 个累积子会话时单事件 3.9ms）。
+ * 摊到每秒一次之后，单事件成本与该父会话的历史累积量无关。
+ */
+const CHILD_PRUNE_INTERVAL_MS = 1000
+
+/**
  * 主角最短停留时间（毫秒）。
  *
  * 为什么需要：两个会话**同时**在干活时，每个事件都会重算主角 ——
@@ -157,6 +181,8 @@ export class PetReducer {
      * 记时刻是为了**静默过期**（子会话没有 end 事件就崩了时，不能把父会话永久钉在"进行中"）。
      */
     this.childSessions = new Map()
+    /** 每个父会话上次整理子表（剔静默过期项）的时刻 */
+    this.childPrunedAt = new Map()
     this.clock = 0
     this.lastSignature = undefined
   }
@@ -167,6 +193,8 @@ export class PetReducer {
     this.includeSubagents = next
     // 子会话自己占一格时，就不该再让父会话替它"显示在跑"（否则同一份工作被数两次）
     this.childSessions = new Map()
+    /** 每个父会话上次整理子表（剔静默过期项）的时刻 */
+    this.childPrunedAt = new Map()
     if (!next) {
       for (const [id, entry] of this.projects) {
         if (entry.subagent) this.projects.delete(id)
@@ -371,6 +399,7 @@ export class PetReducer {
     }
     // 顺带让"子会话静默过期"能自愈：不重算的话，父会话会一直显示进行中，
     // 直到下一条事件到来。#render 自己按签名去重，重复调用不会刷屏。
+    this.#pruneChildSessions()
     const messages = this.#render()
     if (!changed && messages.length === 0) return []
     return messages
@@ -444,6 +473,10 @@ export class PetReducer {
     // 淘汰一个会话时，它挂着的通知**必须一起清**：宿主这边账本已经没了，
     // 原生端却还在显示，之后连清都清不掉（发 notice-clear 的名单也找不到了）
     this.evictionQueue.push(...this.#clearNotices(victim[1], 'evicted'))
+    // 只清**这个**项目的子表（以前这里被误写成整表替换，淘汰任何一个项目都会
+    // 把别的父会话的子任务追踪一起抹掉）
+    this.childSessions.delete(victim[0])
+    this.childPrunedAt.delete(victim[0])
     this.projects.delete(victim[0])
   }
 
@@ -452,15 +485,6 @@ export class PetReducer {
     if (this.evictionQueue.length === 0) return []
     const queued = this.evictionQueue
     this.evictionQueue = []
-    /**
-     * 每个父会话的子会话：`parentSession` → Map<childId, 最近一次活动时刻>。
-     *
-     * 为什么要它：子会话默认不占宠物一格，但它的活动必须让父会话"看起来在跑" ——
-     * 否则父会话的回合结束后气泡就回到待机，而桌面上其实还有子任务在干活。
-     * 用 Map 而不是计数：同一条子会话重复事件不会重复计，`turn/end` 也只减一次；
-     * 记时刻是为了**静默过期**（子会话没有 end 事件就崩了时，不能把父会话永久钉在"进行中"）。
-     */
-    this.childSessions = new Map()
     return queued
   }
 
@@ -498,12 +522,26 @@ export class PetReducer {
     if (!active && !finished) return []
 
     const children = this.childSessions.get(parentId) ?? new Map()
-    const before = this.#activeChildren(parentId).size
-    if (finished) children.delete(childId)
-    else children.set(childId, this.now())
-    if (children.size === 0) this.childSessions.delete(parentId)
-    else this.childSessions.set(parentId, children)
-    if (this.#activeChildren(parentId).size === before) return []
+    const before = children.size
+    if (finished) {
+      children.delete(childId)
+    } else {
+      children.set(childId, this.now())
+      // 上限：别让崩溃的子会话把表撑爆（丢最旧的）。留一点余量 → 裁剪摊还 O(1)
+      if (children.size > MAX_CHILDREN_PER_PARENT + CHILD_CAP_SLACK) {
+        const oldest = [...children].sort((left, right) => left[1] - right[1])
+          .slice(0, children.size - MAX_CHILDREN_PER_PARENT)
+        for (const [id] of oldest) children.delete(id)
+      }
+    }
+    if (children.size === 0) {
+      this.childSessions.delete(parentId)
+      this.childPrunedAt.delete(parentId)
+    } else {
+      this.childSessions.set(parentId, children)
+      this.#activeChildren(parentId) // 顺手整理（有节流，摊还 O(1)）
+    }
+    if (children.size === before) return []
 
     // 父会话可能还没进过账本（插件是中途启动的）：补一个，好让它有气泡可显示
     const entry = this.#parentEntry(parentId, session)
@@ -522,16 +560,41 @@ export class PetReducer {
     return entry
   }
 
-  /** 还在活跃窗口内的子会话（静默太久的当作已经不在跑了）。 */
+  /**
+   * 取某父会话的子表，**顺手**把静默过期的剔掉。
+   *
+   * 关键：整理是有节流的（每个父会话每秒最多一次），所以调用成本整体是
+   * O(1) 摊还，而不是"每次事件复制+过滤整张表"。以前这里是
+   * `new Map([...children].filter(...))` 且**结果不写回** —— 过期项永远留在表里，
+   * 单事件成本随累积量线性上涨（实测 11µs → 3.9ms）。
+   */
   #activeChildren(parentId) {
-    const children = this.childSessions.get(String(parentId))
-    if (!children) return new Map()
+    const key = String(parentId)
+    const children = this.childSessions.get(key)
+    if (!children) return undefined
     const now = this.now()
-    return new Map([...children].filter(([, at]) => now - at < CHILD_STALE_MS))
+    if (now - (this.childPrunedAt.get(key) ?? 0) >= CHILD_PRUNE_INTERVAL_MS) {
+      for (const [childId, at] of children) {
+        if (now - at >= CHILD_STALE_MS) children.delete(childId)
+      }
+      this.childPrunedAt.set(key, now)
+      if (children.size === 0) {
+        this.childSessions.delete(key)
+        this.childPrunedAt.delete(key)
+        return undefined
+      }
+    }
+    return children
   }
 
+  /** 该父会话当前记着几个子会话（O(1)；整理由 #activeChildren/tick 负责）。 */
   #childCount(id) {
-    return this.#activeChildren(id).size
+    return this.childSessions.get(String(id))?.size ?? 0
+  }
+
+  /** 所有父会话都整理一遍（tick 每秒调一次，保证没有新事件时也能自愈）。 */
+  #pruneChildSessions() {
+    for (const parentId of [...this.childSessions.keys()]) this.#activeChildren(parentId)
   }
 
   /**

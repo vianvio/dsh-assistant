@@ -350,9 +350,14 @@ export function mountPet({ ctx, settings, eventCtx, logger = console, tuning = {
     }
     backgroundBusy = true
     try {
+      const startedAt = Date.now()
       const result = await refinePendingParts(ctx, { logger, digests })
+      // 账要能对上：补几段 + 读了几个会话 + 预筛跳过几个 + 用时。
+      // 以前只有"补 N 段"——N 是 0 的原因（没增量？预筛跳光了？全读失败？）一个字都没有。
       logger.info?.(
-        `dsh-assistant: 压缩后已后台总结并留存（触发 ${event?.type ?? '?'}，补 ${result.parts.length} 段）`,
+        `dsh-assistant: 压缩后已后台总结并留存（触发 ${event?.type ?? '?'}，补 ${result.parts.length} 段`
+        + `，读 ${result.scan?.read ?? '?'} 个 / 预筛跳过 ${result.scan?.skipped ?? '?'} 个`
+        + `，用时 ${Date.now() - startedAt}ms）`,
       )
     } catch (error) {
       logger.warn?.(`dsh-assistant: 后台总结失败: ${errorText(error)}`)

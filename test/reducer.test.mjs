@@ -8,7 +8,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
 import { PetMessageKind, PetState } from '../src/protocol.js'
-import { PetReducer } from '../src/pet-reducer.js'
+import { MAX_CHILDREN_PER_PARENT, PetReducer } from '../src/pet-reducer.js'
 import { ProjectStateMachine, TRANSITIONS, Trigger } from '../src/state-machine.js'
 import { machineCopy, stageCopy, statusCopy } from '../src/pet-copy.js'
 import { asksUser, classifyTool, isKnownEvent, normalize, projectName, sessionId, turnEndKind } from '../src/events.js'
@@ -644,6 +644,81 @@ test('子会话：销毁 / 静默超时 / 更急的状态都不该被"有子任�
   const healed = reducer.tick(now)
   assert.equal(reducer.roster()[0].subagents, 0, '静默超过窗口就不再算在跑')
   assert.ok(healed.some((message) => message.kind === 'state'), 'tick 要把画面收回来')
+})
+
+test('子会话表：过期的子会话被真正删掉（不是每次读都过滤一遍、越攒越多）', () => {
+  let now = 1_000_000
+  const reducer = new PetReducer({ now: () => now })
+  const parent = { header: { id: 'p1', cwd: '/tmp/proj' }, cwd: '/tmp/proj' }
+  const child = { header: { id: 'c1', parentSession: 'p1', origin: 'subagent', cwd: '/tmp/proj' }, cwd: '/tmp/proj' }
+  reducer.handle(parent, { type: 'turn/start', seq: 1 })
+  reducer.handle(parent, { type: 'turn/end', seq: 2, data: { reason: { kind: 'completed' } } })
+  reducer.handle(child, { type: 'turn/start', seq: 1 })
+  assert.equal(reducer.childSessions.get('p1')?.size, 1)
+
+  // 子会话崩了（没有 turn/end）→ 静默窗口过去之后要**从表里删掉**。
+  // 旧实现是"读的时候过滤一遍、结果不写回"：显示对了，表却一直涨 ——
+  // 16000 个累积子会话时单事件 3.9ms，而且永远不会降回来。
+  now += 11 * 60 * 1000
+  // 整理走 tick（宿主每秒一次）与"下一个子会话事件"两条路径；
+  // roster() 只读 #childCount（O(1)）—— 这正是它便宜的原因
+  reducer.tick(now)
+  assert.equal(reducer.childSessions.get('p1'), undefined, '过期项必须写回删除，而不是每次读再过滤一次')
+  assert.equal(reducer.roster()[0].subagents, 0)
+})
+
+test('子会话表：崩溃的子会话不会把表撑爆（有上限，丢最旧的）', () => {
+  const reducer = new PetReducer({ now: () => 1_000_000 })
+  const parent = { header: { id: 'p1', cwd: '/tmp/proj' }, cwd: '/tmp/proj' }
+  const child = (id) => ({ header: { id, parentSession: 'p1', origin: 'subagent', cwd: '/tmp/proj' }, cwd: '/tmp/proj' })
+  reducer.handle(parent, { type: 'turn/start', seq: 1 })
+  reducer.handle(parent, { type: 'turn/end', seq: 2, data: { reason: { kind: 'completed' } } })
+
+  // 全是"开工了但没结束"：只靠静默过期，在被刷爆时会先涨到很大
+  for (let i = 1; i <= 500; i += 1) reducer.handle(child(`c${i}`), { type: 'turn/start', seq: i })
+
+  const table = reducer.childSessions.get('p1')
+  assert.ok(table.size >= MAX_CHILDREN_PER_PARENT, `表要留着上限那么多，实际 ${table.size}`)
+  assert.ok(table.size <= MAX_CHILDREN_PER_PARENT + 32, `表必须有界（上限 + 一点余量），实际 ${table.size}`)
+  assert.ok(!table.has('c1'), '丢的是最旧的')
+  assert.ok(table.has('c500'), '留的是最新的')
+  assert.equal(reducer.roster()[0].subagents, table.size, 'roster 的数字就是表的大小（O(1) 读，不重算）')
+
+  // 到顶之后又来事件：单事件成本不该随累积量增长（旧实现每来一个就排一次序）
+  const started = process.hrtime.bigint()
+  for (let i = 501; i <= 3000; i += 1) reducer.handle(child(`c${i}`), { type: 'turn/start', seq: i })
+  const perEvent = Number(process.hrtime.bigint() - started) / 1e6 / 2500 * 1000
+  assert.ok(perEvent < 50, `到顶后单事件成本要有界（实测 ${perEvent.toFixed(1)}µs/事件）`)
+})
+
+test('子会话表：淘汰别的项目时，不该把不相干父会话的子任务追踪一起抹掉', () => {
+  const reducer = new PetReducer({ now: () => 1_000_000, maxSessions: 2 })
+  const parent = (id) => ({ header: { id, cwd: `/p/${id}` }, cwd: `/p/${id}` })
+  const child = (id, parentId, seq = 1) => ({ header: { id, parentSession: parentId, origin: 'subagent', cwd: `/p/${parentId}` }, cwd: `/p/${parentId}` })
+  const idle = (id, seq) => {
+    reducer.handle(parent(id), { type: 'turn/start', seq })
+    reducer.handle(parent(id), { type: 'turn/end', seq: seq + 1, data: { reason: { kind: 'completed' } } })
+  }
+
+  // 淘汰规则：优先最久没动过的。先造 p2（最老）→ 再造 p1（它因为有子任务事件，touchedAt 更新）
+  idle('p2', 10)
+  idle('p1', 1)
+  reducer.handle(child('c1', 'p1'), { type: 'turn/start', seq: 1 })
+  assert.equal(reducer.childSessions.get('p1')?.size, 1)
+
+  idle('p3', 20) // 顶爆容量 → 淘汰的是最老的 p2
+  assert.ok(!reducer.childSessions.has('p2'), '被淘汰的项目自己的子表要清掉')
+  assert.equal(
+    reducer.childSessions.get('p1')?.size, 1,
+    '淘汰**别的**项目时，不相干父会话的子任务追踪必须留着（以前这里是整表 `new Map()`，一淘汰就全抹平）',
+  )
+
+  // 轮到 p1 自己被淘汰时，只该清它自己那一份
+  reducer.handle(child('c2', 'p3'), { type: 'turn/start', seq: 1 })
+  assert.equal(reducer.childSessions.get('p3')?.size, 1)
+  idle('p4', 30)
+  assert.ok(!reducer.childSessions.has('p1'), 'p1 被淘汰了，它自己的子表该清掉')
+  assert.equal(reducer.childSessions.get('p3')?.size, 1, 'p3 还在，不该被牵连')
 })
 
 test('子会话：打开"含子 Agent"时，子会话自己占一格，父会话不再重复显示在跑', () => {

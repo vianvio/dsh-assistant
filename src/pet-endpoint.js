@@ -72,9 +72,43 @@ async function readJsonBody(req, limit = 8192) {
   return value
 }
 
+/**
+ * 拒绝日志器：4xx 过去一个字都不落盘，"面板存不上""点了没反应"都无从查起。
+ *
+ * 但同时要防刷屏（本地端口会被扫描器/坏客户端反复打）：同一形状的拒绝在窗口内只留一行，窗口过去后
+ * 那行会补上"这期间还有 N 次"。窗口内重复的**只计数**，不产生日志。
+ */
+const REJECT_WINDOW_MS = 10_000
+
+function createRejectLogger(logger) {
+  const seen = new Map()
+  return {
+    reject(req, status, detail) {
+      const path = pathnameOf(req)
+      const signature = `${status} ${req.method ?? '?'} ${path} ${detail}`
+      const now = Date.now()
+      const last = seen.get(signature)
+      if (last && now - last.at < REJECT_WINDOW_MS) {
+        last.count += 1
+        return
+      }
+      seen.set(signature, { at: now, count: 0 })
+      // 上一轮窗口积压的次数在这里补上（不丢信息，也不刷屏）
+      const repeat = last && last.count > 0 ? `（上一个${Math.round(REJECT_WINDOW_MS / 1000)}秒内同类还有 ${last.count} 次）` : ''
+      logger?.warn?.(
+        `dsh-assistant: 拒绝 ${signature}${repeat}`
+        + ` —— 来自 ${req.socket?.remoteAddress ?? '未知地址'}`
+        + `，Host=${req.headers?.host ?? '（无）'}`
+        + `，Origin=${req.headers?.origin ?? '（无）'}`,
+      )
+    },
+  }
+}
+
 /** 本机回环 + 同源校验，两个端点共用。 */
-function guardLocalRequest(req, res) {
+function guardLocalRequest(req, res, reject) {
   if (!isLoopback(req.socket?.remoteAddress)) {
+    reject('remote address is not loopback')
     jsonResponse(res, 403, { error: 'local access only' })
     return false
   }
@@ -82,6 +116,7 @@ function guardLocalRequest(req, res) {
   // Host 是攻击者控制的域名（解析到 127.0.0.1），这一条直接挡掉。
   const host = hostnameOf(req.headers?.host)
   if (!isAddressLikeHost(host)) {
+    reject(`Host 不是本地地址（${host || '空'}）`)
     jsonResponse(res, 403, { error: 'host must be a local address' })
     return false
   }
@@ -92,6 +127,7 @@ function guardLocalRequest(req, res) {
     // 以前这里比的是 `new URL(origin).host === req.headers.host` —— 两个值**都来自请求方**，
     // rebinding 下天然相等，等于没判（Host/Origin 都填 evil.example 时能读能写）。
     if (!url || !isAddressLikeHost(url.hostname)) {
+      reject(`Origin 不是本地地址（${origin}）`)
       jsonResponse(res, 403, { error: 'origin mismatch' })
       return false
     }
@@ -99,6 +135,7 @@ function guardLocalRequest(req, res) {
     const originPort = url.port
     const hostPort = portOf(req.headers?.host)
     if (originPort && hostPort && originPort !== hostPort) {
+      reject(`Origin 端口与 Host 端口不一致（${originPort} vs ${hostPort}）`)
       jsonResponse(res, 403, { error: 'origin mismatch' })
       return false
     }
@@ -148,24 +185,26 @@ function pathnameOf(req) {
 /**
  * @param settings 配置作用域（createSettingsScope 的返回值）
  * @param petHandle () => 宠物句柄（可能是 undefined：helper 没起来）
+ * @param logger 组合根传进来的日志器；4xx 一律留痕（403 尤其要留）
  */
-export function createConfigHandler(settings, petHandle) {
+export function createConfigHandler(settings, petHandle, logger = console) {
+  const rejects = createRejectLogger(logger)
   return async (req, res) => {
-    if (!guardLocalRequest(req, res)) return
+    if (!guardLocalRequest(req, res, (detail) => rejects.reject(req, 403, detail))) return
     const path = pathnameOf(req)
 
     if (req.method === 'POST' && path === `${CONFIG_ENDPOINT}/action`) {
-      await handleAction(req, res, petHandle)
+      await handleAction(req, res, petHandle, rejects)
       return
     }
 
     if (req.method === 'POST' && path === VIEWED_ENDPOINT) {
-      await handleViewed(req, res, petHandle)
+      await handleViewed(req, res, petHandle, rejects)
       return
     }
 
     if (req.method === 'GET' && path === PENDING_ENDPOINT) {
-      await handlePending(req, res, petHandle)
+      await handlePending(req, res, petHandle, rejects)
       return
     }
 
@@ -192,16 +231,18 @@ export function createConfigHandler(settings, petHandle) {
         await settings.update(patch)
         jsonResponse(res, 200, { ...settings.get(), fields: fieldMetadata() })
       } catch (error) {
-        jsonResponse(res, 400, { error: error instanceof Error ? error.message : String(error) })
+        rejects.reject(req, 400, messageOf(error))
+        jsonResponse(res, 400, { error: messageOf(error) })
       }
       return
     }
 
+    rejects.reject(req, 405, '路径不在白名单内')
     jsonResponse(res, 405, { error: 'method not allowed' })
   }
 }
 
-async function handleAction(req, res, petHandle) {
+async function handleAction(req, res, petHandle, rejects) {
   try {
     const body = await readJsonBody(req)
     const action = String(body.action ?? '')
@@ -214,14 +255,21 @@ async function handleAction(req, res, petHandle) {
       return
     }
     if (!INTERACTION_ACTIONS.includes(action)) {
+      rejects?.reject(req, 400, `未知动作 ${action || '（空）'}`)
       jsonResponse(res, 400, { error: `unknown action: ${action}` })
       return
     }
     const delivered = handle?.act?.(action) === true
     jsonResponse(res, delivered ? 200 : 409, { action, delivered })
   } catch (error) {
-    jsonResponse(res, 400, { error: error instanceof Error ? error.message : String(error) })
+    rejects?.reject(req, 400, messageOf(error))
+    jsonResponse(res, 400, { error: messageOf(error) })
   }
+}
+
+/** 统一取错误文案（日志与响应体同一份，排查时能对上）。 */
+function messageOf(error) {
+  return error instanceof Error ? error.message : String(error)
 }
 
 /**
@@ -231,7 +279,7 @@ async function handleAction(req, res, petHandle) {
  * 而点通知到界面切换之间几乎无延迟 —— 做不到推送，这是最省又不牺牲手感的一档。
  * 拿不到宠物句柄（helper 没起来）就立刻回空，不让客户端白等。
  */
-async function handlePending(req, res, petHandle) {
+async function handlePending(req, res, petHandle, rejects) {
   try {
     const handle = petHandle?.()
     // helper 没在跑 → 没人会去点通知，别让客户端白挂 20 秒
@@ -241,7 +289,10 @@ async function handlePending(req, res, petHandle) {
     const command = running ? await handle.nextCommand(wait) : undefined
     jsonResponse(res, 200, { commands: command ? [command] : [] })
   } catch (error) {
-    jsonResponse(res, 200, { commands: [], error: error instanceof Error ? error.message : String(error) })
+    // 响应仍然是 200（长轮询失败不该让客户端报错），但**必须留痕**：
+    // 这里出问题以前表现为"通知点了没反应"，而日志里什么都没有。
+    rejects?.reject(req, '200/长轮询异常', messageOf(error))
+    jsonResponse(res, 200, { commands: [], error: messageOf(error) })
   }
 }
 
@@ -253,7 +304,7 @@ async function handlePending(req, res, petHandle) {
  * 用户点进去不会再有任何事件 —— 通知于是永远挂着。
  * 真正知道"用户在看哪个会话"的只有客户端（会话列表的 current），所以由它上报。
  */
-async function handleViewed(req, res, petHandle) {
+async function handleViewed(req, res, petHandle, rejects) {
   try {
     const body = await readJsonBody(req)
     const sessionId = String(body.sessionId ?? '')
@@ -261,6 +312,7 @@ async function handleViewed(req, res, petHandle) {
     const cleared = petHandle?.()?.viewed?.(sessionId) ?? 0
     jsonResponse(res, 200, { sessionId, cleared })
   } catch (error) {
-    jsonResponse(res, 400, { error: error instanceof Error ? error.message : String(error) })
+    rejects?.reject(req, 400, messageOf(error))
+    jsonResponse(res, 400, { error: messageOf(error) })
   }
 }

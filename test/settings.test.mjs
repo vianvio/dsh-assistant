@@ -22,10 +22,17 @@ import {
   publicConfig,
 } from '../src/pet-settings.js'
 import { CONFIG_ENDPOINT, PENDING_ENDPOINT, VIEWED_ENDPOINT, createConfigHandler } from '../src/pet-endpoint.js'
+
 import { configMessage } from '../src/pet.js'
 import { NATIVE_FIELDS } from '../src/pet-settings.js'
 import { fakeRequest, fakeResponse } from './helpers/http.mjs'
 import { PetMessageKind } from '../src/protocol.js'
+
+/** 测试用的端点构造器：拒绝日志走本地静音器（要验日志的用例自己传 logger）。 */
+function makeHandler(settings, petHandle, logger = { debug() {}, warn() {} }) {
+  return createConfigHandler(settings, petHandle, logger)
+}
+
 
 /* ------------------------------------------------------------ 归一化 */
 
@@ -215,7 +222,7 @@ test('配置下发：自动互动的开关与间隔会送到原生端（关掉�
 
 test('设置端点：GET/PATCH 正常，未知字段被拒', async () => {
   const settings = createMemoryScope(defaults)
-  const handler = createConfigHandler(settings, () => undefined)
+  const handler = makeHandler(settings, () => undefined)
   const read = fakeResponse()
   await handler(fakeRequest(), read)
   assert.equal(read.state.status, 200)
@@ -243,13 +250,13 @@ test('设置端点：PATCH 会通知订阅者（设置页改了、宠物立刻�
   const settings = createMemoryScope(defaults)
   const seen = []
   settings.watch((next) => seen.push(next.scale))
-  const handler = createConfigHandler(settings, () => undefined)
+  const handler = makeHandler(settings, () => undefined)
   await handler(fakeRequest({ method: 'PATCH', body: { scale: 0.85 } }), fakeResponse())
   assert.deepEqual(seen, [0.85])
 })
 
 test('设置端点：非回环 / 跨源 / 未知方法都被挡', async () => {
-  const handler = createConfigHandler(createMemoryScope(defaults), () => undefined)
+  const handler = makeHandler(createMemoryScope(defaults), () => undefined)
   const remote = fakeResponse()
   await handler(fakeRequest({ address: '10.1.2.3' }), remote)
   assert.equal(remote.state.status, 403)
@@ -297,7 +304,7 @@ test('设置端点：非回环 / 跨源 / 未知方法都被挡', async () => {
 })
 
 test('互动端点：动作白名单 + 未运行时报 409', async () => {
-  const handler = createConfigHandler(createMemoryScope(defaults), () => undefined)
+  const handler = makeHandler(createMemoryScope(defaults), () => undefined)
   const unknown = fakeResponse()
   await handler(fakeRequest({
     method: 'POST', url: `${CONFIG_ENDPOINT}/action`, body: { action: 'explode' },
@@ -311,7 +318,7 @@ test('互动端点：动作白名单 + 未运行时报 409', async () => {
   assert.equal(offline.state.status, 409)
 
   const seen = []
-  const live = createConfigHandler(createMemoryScope(defaults), () => ({ isRunning: true, act: (action) => { seen.push(action); return true } }))
+  const live = makeHandler(createMemoryScope(defaults), () => ({ isRunning: true, act: (action) => { seen.push(action); return true } }))
   const delivered = fakeResponse()
   await live(fakeRequest({
     method: 'POST', url: `${CONFIG_ENDPOINT}/action`, body: { action: 'feed' },
@@ -322,7 +329,7 @@ test('互动端点：动作白名单 + 未运行时报 409', async () => {
 
 test('互动端点：summary 走宿主后台任务，不是原生动作', async () => {
   const started = []
-  const handler = createConfigHandler(createMemoryScope(defaults), () => ({
+  const handler = makeHandler(createMemoryScope(defaults), () => ({
     isRunning: true,
     summarize: () => { started.push('summary'); return true },
   }))
@@ -334,7 +341,7 @@ test('互动端点：summary 走宿主后台任务，不是原生动作', async 
   assert.deepEqual(started, ['summary'])
 
   // 总结正在跑 / helper 没起来时 summarize() 返回 false → 409
-  const busy = createConfigHandler(createMemoryScope(defaults), () => ({ isRunning: true, summarize: () => false }))
+  const busy = makeHandler(createMemoryScope(defaults), () => ({ isRunning: true, summarize: () => false }))
   const conflict = fakeResponse()
   await busy(fakeRequest({
     method: 'POST', url: `${CONFIG_ENDPOINT}/action`, body: { action: 'summary' },
@@ -344,7 +351,7 @@ test('互动端点：summary 走宿主后台任务，不是原生动作', async 
 
 test('查看上报：客户端说"我在看这个会话"，端点转给宿主清通知', async () => {
   const seen = []
-  const handler = createConfigHandler(createMemoryScope(defaults), () => ({
+  const handler = makeHandler(createMemoryScope(defaults), () => ({
     isRunning: true,
     viewed: (sessionId) => { seen.push(sessionId); return sessionId === 's1' ? 1 : 0 },
   }))
@@ -356,7 +363,7 @@ test('查看上报：客户端说"我在看这个会话"，端点转给宿主清
   assert.deepEqual(seen, ['s1'], 'sessionId 要原样传给宿主（大小写/前缀都不能改）')
 
   // helper 没起来时宿主句柄是 undefined：不报错，只是没清掉
-  const offline = createConfigHandler(createMemoryScope(defaults), () => undefined)
+  const offline = makeHandler(createMemoryScope(defaults), () => undefined)
   const none = fakeResponse()
   await offline(fakeRequest({ method: 'POST', url: VIEWED_ENDPOINT, body: { sessionId: 's2' } }), none)
   assert.equal(none.state.status, 200)
@@ -369,7 +376,7 @@ test('查看上报：客户端说"我在看这个会话"，端点转给宿主清
 })
 
 test('查看上报：同样要过回环 / 同源门禁', async () => {
-  const handler = createConfigHandler(createMemoryScope(defaults), () => ({ viewed: () => 0 }))
+  const handler = makeHandler(createMemoryScope(defaults), () => ({ viewed: () => 0 }))
   const remote = fakeResponse()
   await handler(fakeRequest({ method: 'POST', url: VIEWED_ENDPOINT, body: { sessionId: 's1' }, address: '10.1.2.3' }), remote)
   assert.equal(remote.state.status, 403)
@@ -385,7 +392,7 @@ test('查看上报：同样要过回环 / 同源门禁', async () => {
 test('命令通道：长轮询把宿主的"打开会话"取走，取完即空', async () => {
   const queue = [{ kind: 'open-session', sessionId: 's1' }]
   const waits = []
-  const handler = createConfigHandler(createMemoryScope(defaults), () => ({
+  const handler = makeHandler(createMemoryScope(defaults), () => ({
     isRunning: true,
     nextCommand: async (timeoutMs) => { waits.push(timeoutMs); return queue.shift() },
   }))
@@ -401,7 +408,7 @@ test('命令通道：长轮询把宿主的"打开会话"取走，取完即空', 
   assert.ok(waits[0] > 0, '端点要带上等待时长，让宿主做长轮询')
 
   // helper 没起来：也要立刻回空，别让客户端一直挂着
-  const offline = createConfigHandler(createMemoryScope(defaults), () => undefined)
+  const offline = makeHandler(createMemoryScope(defaults), () => undefined)
   const none = fakeResponse()
   await offline(fakeRequest({ url: PENDING_ENDPOINT }), none)
   assert.equal(none.state.status, 200)
@@ -409,7 +416,7 @@ test('命令通道：长轮询把宿主的"打开会话"取走，取完即空', 
 })
 
 test('命令通道：nextCommand 抛错也不该把端点带崩', async () => {
-  const handler = createConfigHandler(createMemoryScope(defaults), () => ({
+  const handler = makeHandler(createMemoryScope(defaults), () => ({
     nextCommand: async () => { throw new Error('boom') },
   }))
   const response = fakeResponse()
@@ -419,7 +426,7 @@ test('命令通道：nextCommand 抛错也不该把端点带崩', async () => {
 })
 
 test('设置端点：GET 带上主角与并行名单', async () => {
-  const handler = createConfigHandler(createMemoryScope(defaults), () => ({
+  const handler = makeHandler(createMemoryScope(defaults), () => ({
     isRunning: true,
     focus: () => ({ id: 'a', project: 'agent-mesh', state: 'WORKING', message: '正在执行项目命令' }),
     roster: () => [{ id: 'a', project: 'agent-mesh', state: 'WORKING', active: true }],
@@ -506,6 +513,14 @@ test('设置契约：端点的路径字面量只有一处（面板那份由这�
   const literal = new RegExp(`CONFIG_ENDPOINT\\s*=\\s*'${CONFIG_ENDPOINT}'`, 'u')
   assert.match(client, literal, '面板里的端点字面量必须与 pet-endpoint 导出的常量一致')
 
+  // 组合根必须把真日志器交进来：默认参数只是兜底，漏传 = 4xx 又变成静默
+  const index = readFileSync(join(process.cwd(), 'src', 'index.js'), 'utf8')
+  assert.match(
+    index,
+    /createConfigHandler\(settings, \(\) => pet, logger\)/u,
+    'src/index.js 注册端点时必须传 logger，否则拒绝日志无处可去',
+  )
+
   // 测试自己也别手抄
   for (const file of ['test/client.test.mjs', 'test/settings.test.mjs', 'test/dsh-integration.test.mjs']) {
     const source = readFileSync(join(process.cwd(), file), 'utf8')
@@ -514,6 +529,101 @@ test('设置契约：端点的路径字面量只有一处（面板那份由这�
   }
   assert.equal(VIEWED_ENDPOINT, `${CONFIG_ENDPOINT}/viewed`)
   assert.equal(PENDING_ENDPOINT, `${CONFIG_ENDPOINT}/pending`)
+})
+
+test('设置：读不到用户层时要留下告警（且只留一条），并且不缓存这个失败', async () => {
+  const { createSettingsScope, fallbackSchema } = await import('../src/pet-settings.js')
+
+  let explode = true
+  const user = { scale: 1.35 }
+  const provider = {
+    register(ns, schema, options) {
+      const resolved = () => ({ ...(options.base ?? {}), ...user })
+      return {
+        get: () => schema(resolved()),
+        update: async (patch) => { Object.assign(user, patch) },
+        watch: () => () => {},
+      }
+    },
+    describe: () => {
+      if (explode) throw new Error('IPC 断了')
+      return [{ ns: 'dsh-assistant', user: { ...user } }]
+    },
+  }
+
+  const warnings = []
+  const scope = createSettingsScope(
+    {},
+    {},
+    { debug() {}, warn(line) { warnings.push(line) } },
+    { provider, schema: fallbackSchema },
+  )
+
+  // 读不到用户层 → 判成"没设过"（保守方向：不拿默认值去冲掉原生端自己的值）
+  assert.equal(scope.overridden('scale'), false)
+
+  // **但不能静默**：以前是空 catch，表现成"设置明明存了却不生效"，日志里一个字都没有
+  assert.equal(warnings.length, 1, `恰好一条告警，实际 ${warnings.length} 条`)
+  assert.match(warnings[0], /IPC 断了/u, '告警要带失败原因')
+  assert.match(warnings[0], /describe|用户层/u, '告警要说清是哪一步失败')
+
+  // configMessage 每个字段都来问一遍 —— 不限制就会刷屏
+  for (let i = 0; i < 50; i += 1) scope.overridden(['scale', 'bubbleTheme', 'soundEnabled'][i % 3])
+  assert.equal(warnings.length, 1, '反复问同一个 provider 也只告警一次')
+
+  // 失败不能被缓存住：provider 缓过来之后必须立刻恢复判定（否则"设了不生效"换个姿势再来一遍）
+  explode = false
+  assert.equal(scope.overridden('scale'), true, 'provider 恢复后要读到用户层')
+  assert.equal(scope.overridden('bubbleTheme'), false, '用户没设过的字段仍然判成没设过')
+  assert.equal(warnings.length, 1, '恢复过程不该再刷告警')
+
+  // 成功的读会短缓存（describe() 要深拷贝整份 user 层，拖滑块时每个字段都问一遍太浪费），
+  // 但**写完之后必须立刻失效**：不然就是"设置明明存了却不生效"换了个位置复发
+  await scope.update({ soundEnabled: false })
+  assert.equal(scope.overridden('soundEnabled'), true, '刚写过的字段要立刻判成"用户设过"')
+})
+
+test('设置：被拒的请求要留痕（403/400/405），同类拒绝不刷屏', async (t) => {
+  const warnings = []
+  const logger = { debug() {}, warn: (line) => warnings.push(line) }
+  const handler = createConfigHandler(createMemoryScope(defaults), () => undefined, logger)
+  const send = async (options) => {
+    const res = fakeResponse()
+    await handler(fakeRequest(options), res)
+    return res.state.status
+  }
+
+  // ① 403：Host 是域名（DNS rebinding 的形状）—— 被扫了必须能从日志看出来
+  assert.equal(await send({ headers: { host: 'evil.example' } }), 403)
+  assert.equal(warnings.length, 1, `403 要留痕，实际: ${JSON.stringify(warnings)}`)
+  assert.match(warnings[0], /拒绝 403 GET/u, '要写清状态码与方法')
+  assert.match(warnings[0], /Host 不是本地地址（evil\.example）/u, '要写清拒绝原因')
+  assert.match(warnings[0], /Host=evil\.example/u, '要带上 Host')
+  assert.match(warnings[0], /127\.0\.0\.1/u, '要带上来源地址')
+
+  // ② Origin 不是本地地址（跨站页面往里打的形状）
+  assert.equal(await send({ method: 'PATCH', headers: { origin: 'http://evil.example' }, body: { scale: 1 } }), 403)
+  assert.match(warnings.at(-1), /Origin 不是本地地址/u)
+
+  // ③ 400：面板存不上时最该看到的一条（以前一个字都没有）
+  assert.equal(await send({ method: 'PATCH', body: { hack: 1 } }), 400)
+  assert.match(warnings.at(-1), /拒绝 400 PATCH/u, '写入被拒要留痕')
+  assert.match(warnings.at(-1), /hack/u, '原因里要能看出是哪个字段')
+
+  // ④ 405：白名单外的方法
+  assert.equal(await send({ method: 'DELETE' }), 405)
+  assert.match(warnings.at(-1), /拒绝 405 DELETE/u)
+
+  // ⑤ 刷屏防护：同一形状连打 30 次，窗口内只留一行
+  const before = warnings.length
+  for (let i = 0; i < 30; i += 1) await send({ method: 'DELETE' })
+  assert.equal(warnings.length, before, '窗口内同类拒绝只记一次（不刷屏）')
+
+  // ⑥ 窗口过去后，被压掉的次数要补出来（信息不丢）
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() + 60_000 })
+  await send({ method: 'DELETE' })
+  assert.match(warnings.at(-1), /拒绝 405 DELETE/u)
+  assert.match(warnings.at(-1), /同类还有 30 次/u, `要补出被压掉的次数，实际: ${warnings.at(-1)}`)
 })
 
 test('设置：provider 在位但拿不到 schemastery 时，仍然走服务存储（不静默退回内存）', async () => {

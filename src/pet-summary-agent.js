@@ -62,6 +62,15 @@ export async function collectSessions(ctx, logger = console, { digests, activity
   const files = activity ?? createSessionActivityIndex()
   // 让出方式可注入：测试要能数"让出了几次"，而不是靠时间窗口去碰运气
   const pause = onYield ?? yieldToLoop
+  const startedAt = performance.now()
+  // 索引是**后台**建的（构建不再卡事件循环）。这里等第一次结果落地：不等也不会错，
+  // 只是那一轮所有会话都判成"不知道" ⇒ 全读（预筛白设）。
+  try {
+    await files?.ready?.()
+  } catch (error) {
+    logger.warn?.(`dsh-assistant: 会话活动索引不可用，本轮不预筛: ${message(error)}`)
+  }
+  const readyMs = Math.round(performance.now() - startedAt)
   // 扫描**开始**就取走脏集：扫描期间新到的事件留给下一轮（这一轮的摘要已经不含它们）
   const pending = cache.takeDirty()
   const since = cache.windowStart
@@ -121,11 +130,39 @@ export async function collectSessions(ctx, logger = console, { digests, activity
   // 留一条可查的账：首轮预筛跳了多少、**这一轮**读了多少（"日报怎么变快了"要能一眼看懂）。
   // 用本轮计数而不是 cache.reads（那个只增不减，是实例累计值 —— 第二轮明明一次都没读
   // 日志却写着"读 2 个"，账就白记了）
+  // 索引的 stats 也一并落进这条账里：预筛"没跳掉该跳的"时要能一眼看出是索引没建起来
+  //（构建失败/目录不在 → 全是 undefined → 一个都没跳过），而不是只能猜。
+  const activityStats = files?.stats
+  const elapsedMs = Math.round(performance.now() - startedAt)
   logger.debug?.(
     `dsh-assistant: 总结扫描：本轮读 ${roundReads} 个 / 预筛跳过 ${skipped} 个`
-    + `（缓存命中 ${cache.stats.size} 个会话，累计读 ${cache.reads} 次）`,
+    + `（缓存命中 ${cache.stats.size} 个会话，累计读 ${cache.reads} 次`
+    + (activityStats ? `；活动索引 ${activityStats.entries} 项，失败 ${activityStats.failures} 次` : '')
+    + `；用时 ${elapsedMs}ms（其中等索引 ${readyMs}ms））`,
   )
-  return { records, digests: cache, titleOf: (id) => titles.get(String(id)) }
+  if (activityStats && activityStats.failures > 0) {
+    logger.warn?.(
+      `dsh-assistant: 活动索引有 ${activityStats.failures} 次读取失败（首个 ${activityStats.firstFailure}），`
+      + `受影响的部分会话会退化成整段读取`,
+    )
+  }
+  return {
+    records,
+    digests: cache,
+    titleOf: (id) => titles.get(String(id)),
+    // **可复算的账**：调用方把它一起打进结果日志里，"日报怎么变快了/怎么什么都没提炼出来"
+    // 才不用靠猜（以前只写"补 N 段"，N 是 0 还是 3 的原因一个字都没有）
+    scan: {
+      read: roundReads,
+      skipped,
+      cached: cache.stats.size,
+      sessions: ids.length,
+      activityEntries: activityStats?.entries ?? 0,
+      activityFailures: activityStats?.failures ?? 0,
+      elapsedMs,
+      readyMs,
+    },
+  }
 }
 
 /** 把主线程让出去一轮（见 collectSessions 的第 3 条）。 */
@@ -212,7 +249,9 @@ export async function runHiddenSession(ctx, { prompt, cwd, logger = console, tim
     })
 
     handle.agent.followup(createUserPrompt(prompt))
-    logger.info?.(`dsh-assistant: 总结会话已启动（模型 ${selection.model ?? '默认'}）`)
+    // **debug**，不是 info：一次日报要开 N+1 个隐藏会话（每会话一个 + 最后汇总一次），
+    // 落在 info 上就是"跑一次日报刷 N 行日志"。真正该在 info 上的是那条汇总结果（含账）。
+    logger.debug?.(`dsh-assistant: 总结会话已启动（模型 ${selection.model ?? '默认'}）`)
     await Promise.race([handle.agent.whenIdle(), aborted])
     // 落盘屏障：读完就 dispose，先确保事件都进持久化层
     await sessions?.flush?.(handle.agent.session)

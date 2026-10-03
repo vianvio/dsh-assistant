@@ -296,6 +296,9 @@ export function createSettingsScope(ctx, compositionConfig = {}, logger = consol
   const schema = options.schema ?? effectiveSchema()
 
   if (provider) {
+    let warnedOnce = false
+    /** 用户层的短缓存：拖滑块时配置会连续下发，每个字段都去 describe() 一次太浪费。 */
+    let userCache
     try {
       const scope = provider.register(SETTINGS_NAMESPACE, schema, { base, applies: 'live' })
       logger.debug?.(`[dsh-assistant] 设置存储: DSH 设置服务（持久化到 ${SETTINGS_NAMESPACE} 段）`)
@@ -304,10 +307,31 @@ export function createSettingsScope(ctx, compositionConfig = {}, logger = consol
         get: () => publicConfig(scope.get()),
         update: async (patch) => {
           await scope.update(writablePatch(patch))
+          userCache = undefined // 刚写过，下次判定必须重新读（否则"设了不生效"）
           return publicConfig(scope.get())
         },
-        watch: (callback) => scope.watch((next) => callback(publicConfig(next))),
-        overridden: (field) => userFields(provider).has(field),
+        watch: (callback) => scope.watch((next) => {
+          userCache = undefined // 用户层可能在别处被改了（DSH 自己的设置界面也写这一份）
+          callback(publicConfig(next))
+        }),
+        overridden: (field) => {
+          // 缓存很短（250ms）且**只缓存成功的读**：
+          //   · 不缓存 = 每个字段一次 describe()，而它会深拷贝整份 user 层（拖滑块时每个字段都问一遍）；
+          //   · 缓存久了 = "设置明明存了却不生效"（刚 update 过又读到旧的一份）。
+          // 读取失败绝不缓存 —— provider 恢复后要立刻能读到，否则同一个毛病换个姿势再来一遍。
+          // 告警限制成一次：configMessage 每个字段都会来问，不限制会刷屏。
+          const quiet = warnedOnce ? undefined : {
+            debug: (line) => logger.debug?.(line),
+            warn: (line) => { warnedOnce = true; logger.warn?.(line) },
+          }
+          const now = Date.now()
+          if (!userCache || now - userCache.at > USER_FIELDS_TTL_MS) {
+            const read = userFields(provider, quiet)
+            if (read) userCache = { at: now, fields: read }
+            return read ? read.has(field) : false
+          }
+          return userCache.fields.has(field)
+        },
       }
     } catch (error) {
       logger.warn?.(
@@ -347,19 +371,36 @@ export function createMemoryScope(base = defaults) {
   }
 }
 
+/** 用户层判定的短缓存窗口（毫秒）。 */
+const USER_FIELDS_TTL_MS = 250
+
 /**
  * DSH 设置里该 namespace 的**用户层**有哪些字段：出现在这里 = 用户显式改过。
  *
- * `describe()` 会把每个 namespace 的 base/user 各深拷贝一份，所以一次算全量、
- * 不要每个字段查一次（拖滑块时配置会连续下发）。
+ * `describe()` 会把每个 namespace 的 base/user 各深拷贝一份，所以调用方要短缓存
+ * （见 `overridden`），别每个字段都调一次（拖滑块时配置会连续下发）。
+ *
+ * @returns {Set<string>|undefined} 读不到就返回 undefined —— 调用方**不要缓存它**，下次要重试
  */
-function userFields(provider) {
+function userFields(provider, logger) {
+  if (typeof provider?.describe !== 'function') {
+    // 有的 provider 就是不支持 describe：这里不是错误，说一声就够
+    logger?.debug?.('dsh-assistant: 设置服务没有 describe()，无法判断"用户显式设过哪些字段"')
+    return undefined
+  }
   try {
-    const descriptor = provider.describe?.({ redactSecrets: true })
+    const descriptor = provider.describe({ redactSecrets: true })
       ?.find?.((entry) => entry?.ns === SETTINGS_NAMESPACE)
     return new Set(descriptor?.user ? Object.keys(descriptor.user) : [])
-  } catch {
-    return new Set()
+  } catch (error) {
+    // **不能静默**：读不到用户层 = 所有字段都判成"没设过" = 一条都不下发给原生端，
+    // 表现是"设置明明存了却不生效"，而日志里一个字都没有，排查无从下手。
+    // 保守方向不变（宁可不发，也不拿默认值去冲掉原生端菜单里调好的值），但要说清楚。
+    logger?.warn?.(
+      `dsh-assistant: 读设置服务（${provider?.constructor?.name ?? 'provider'}）的用户层失败，`
+      + `本次不向原生端下发任何字段（原生端会保持自己那份值）: ${message(error)}`,
+    )
+    return undefined
   }
 }
 

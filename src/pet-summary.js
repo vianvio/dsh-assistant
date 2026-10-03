@@ -22,7 +22,7 @@ import {
 } from './pet-summary-corpus.js'
 import { collectSessions, runHiddenSession } from './pet-summary-agent.js'
 import { createSessionDigests } from './pet-summary-digest.js'
-import { appendPart, partsFor, storePath, summarizedUntil } from './pet-summary-store.js'
+import { appendParts, partsForMany, readStore as readSummaryStore, storePath } from './pet-summary-store.js'
 import { SETTINGS_DISPLAY_NAME, SETTINGS_FIELDS } from './pet-settings.js'
 
 /**
@@ -56,13 +56,24 @@ export function summaryHint({ backgroundSummary } = {}) {
     + '多个会话也不会互相干扰。'
 }
 
+/** 一次读出所有会话的水位（sessionId → untilTime）。 */
+function watermarksOf(storeFile, logger) {
+  const store = readSummaryStore(storeFile, { logger })
+  const marks = new Map()
+  for (const [sessionId, entry] of Object.entries(store.sessions)) {
+    const parts = entry.parts ?? []
+    marks.set(sessionId, parts.length === 0 ? 0 : parts[parts.length - 1].untilTime)
+  }
+  return marks
+}
+
 /**
  * 全量模式：所有会话一个 prompt。
  *
  * @returns {Promise<{ markdown: string, sessions: number }>}
  */
 export async function generateTodaySummary(ctx, { logger = console, now = Date.now(), digests } = {}) {
-  const { records, digests: scanned, titleOf } = await collectSessions(ctx, logger, { digests })
+  const { records, digests: scanned, titleOf, scan } = await collectSessions(ctx, logger, { digests })
   const { sessions: today, chunks } = buildCorpus(records, scanned, { now, titleOf })
   if (today.length === 0) throw new Error('今天还没有可总结的会话')
 
@@ -73,7 +84,37 @@ export async function generateTodaySummary(ctx, { logger = console, now = Date.n
     date,
     logger,
   })
-  return { markdown, sessions: today.length }
+  logger.info?.(
+    `dsh-assistant: 今日总结完成（全量模式，读 ${scan?.read ?? '?'} 个会话`
+    + `、预筛跳过 ${scan?.skipped ?? '?'} 个，${markdown.length} 字）`,
+  )
+  return { markdown, sessions: today.length, scan }
+}
+
+/**
+ * 提炼并发上限。
+ *
+ * 每个会话要等一次模型往返（秒级起步），串行跑 20 个会话就是分钟级 ——
+ * 后台路径无所谓，但"今天干了什么"是点了按钮当场等的，串行会一路卡到超时。
+ * 4 是保守值：模型侧本来就会排队，再宽不会更快，只会让首个结果来得更晚。
+ */
+export const REFINE_CONCURRENCY = 4
+
+/**
+ * 有界并发 map：**结果按输入顺序**（日报的分段顺序必须稳定，否则同样输入两次跑出两版）。
+ * 单个任务抛错会打断整批 —— worker 自己负责兜住（这里就是提炼那层 try/catch）。
+ */
+async function eachLimited(items, limit, worker) {
+  const width = Math.max(1, Math.min(Math.trunc(limit) || 1, items.length))
+  let next = 0
+  await Promise.all(Array.from({ length: width }, async () => {
+    for (;;) {
+      const index = next
+      next += 1
+      if (index >= items.length) return
+      await worker(items[index], index)
+    }
+  }))
 }
 
 /**
@@ -89,63 +130,70 @@ export async function generateTodaySummary(ctx, { logger = console, now = Date.n
  */
 export async function refinePendingParts(ctx, {
   logger = console, now = Date.now(), storeFile = storePath(), onPart, digests,
+  concurrency = REFINE_CONCURRENCY,
 } = {}) {
-  const { records, digests: scanned, titleOf } = await collectSessions(ctx, logger, { digests })
+  const { records, digests: scanned, titleOf, scan } = await collectSessions(ctx, logger, { digests })
+  // 水位**读一次**整份就够：以前 summarizeUntil 是逐会话调用的，每个会话都把
+  // 整份 summaries.json 重新 parse 一遍（N 个会话 = N 次整份读）
+  const watermarks = watermarksOf(storeFile, logger)
   const deltas = extractDeltas(records, scanned, {
     now,
-    summarizedUntilOf: (sessionId) => summarizedUntil(sessionId, storeFile),
+    summarizedUntilOf: (sessionId) => watermarks.get(String(sessionId)) ?? 0,
   })
   if (deltas.length === 0) throw new Error('今天还没有可总结的会话')
 
   const fallbackCwd = cwdOf(deltas)
-  const parts = []
-  let index = 0
-  for (const delta of deltas) {
-    index += 1
-    delta.title = titleOf(delta.id) ?? delta.cwd ?? '未命名会话'
-    onPart?.({ index, total: deltas.length, title: delta.title })
+  // 结果按下标落位：完成顺序会乱，但日报分段顺序必须按会话顺序稳定
+  const refined = new Array(deltas.length)
+  const width = Math.max(1, Math.min(Math.trunc(concurrency) || 1, deltas.length))
+  logger.debug?.(`dsh-assistant: 提炼 ${deltas.length} 个会话，并发 ${width}`)
+  await eachLimited(deltas, width, async (delta, position) => {
     try {
+      delta.title = titleOf(delta.id) ?? delta.cwd ?? '未命名会话'
+      onPart?.({ index: position + 1, total: deltas.length, title: delta.title })
       const markdown = await runHiddenSession(ctx, {
         prompt: buildSessionPrompt(delta),
         cwd: delta.cwd || fallbackCwd,
         logger,
       })
       if (markdown) {
-        parts.push({ id: delta.id, title: delta.title, cwd: delta.cwd, untilTime: delta.untilTime, markdown })
+        refined[position] = {
+          id: delta.id, title: delta.title, cwd: delta.cwd, untilTime: delta.untilTime, markdown,
+        }
       }
     } catch (error) {
-      // 单个会话失败不该毁掉整份日报：记一笔，继续下一个
+      // 单个会话失败不该毁掉整份日报：记一笔，继续下一个（并发的其它几个也不受影响）
       logger.warn?.(`dsh-assistant: 会话 ${delta.id} 提炼失败: ${error instanceof Error ? error.message : String(error)}`)
     }
-  }
+  })
+  const parts = refined.filter(Boolean)
   if (parts.length === 0) throw new Error('所有会话都没提炼出内容')
 
   // 落盘：下次只取这些水位之后的新增部分。
-  // **每个会话各自 try/catch** —— 这句注释一直写着"失败也不要紧，最多是下次多提炼一遍"，
-  // 但以前没有 catch：另一个进程正好在写（或目录不可写）时抛出的 ENOENT/EEXIST 会
-  // 一路冒到 pet.js 的 catch，把**已经提炼好的整份日报**一起废掉。
-  for (const part of parts) {
-    try {
-      appendPart({
-        sessionId: part.id,
-        title: part.title,
-        cwd: part.cwd,
-        untilTime: part.untilTime,
-        markdown: part.markdown,
-      }, storeFile)
-    } catch (error) {
-      logger.warn?.(
-        `dsh-assistant: 水位落盘失败（不影响本次日报）: ${error instanceof Error ? error.message : String(error)}`,
-      )
-    }
+  // **一次批量写**（加锁一次 / 读一次 / 写一次）—— 以前逐段 appendPart，一次日报
+  // N 段就是 N 次整份读 + N 次整份写，写成 N × 库大小。
+  // 整段 try/catch：失败"最多是下次多提炼一遍"，绝不该把已经提炼好的日报一起废掉。
+  try {
+    await appendParts(parts.map((part) => ({
+      sessionId: part.id,
+      title: part.title,
+      cwd: part.cwd,
+      untilTime: part.untilTime,
+      markdown: part.markdown,
+    })), storeFile, { logger })
+  } catch (error) {
+    logger.warn?.(
+      `dsh-assistant: 水位落盘失败（不影响本次日报）: ${error instanceof Error ? error.message : String(error)}`,
+    )
   }
   // 今天的**全部**片段 = 磁盘上留存的（今天那份）+ 本轮增量。
   // 以前只把本轮增量交出去，于是"上午压缩过的那段"进了库却永远不进汇总提示词 ——
   // 增量模式的日报只覆盖最后一次压缩之后的内容（store 里明明存着）。
   const since = startOfToday(now)
   const todayParts = []
+  const storedBySession = partsForMany(parts.map((part) => part.id), storeFile, { logger })
   for (const part of parts) {
-    const stored = partsFor(part.id, storeFile).filter((entry) => entry.untilTime >= since)
+    const stored = (storedBySession.get(String(part.id)) ?? []).filter((entry) => entry.untilTime >= since)
     const merged = new Map(stored.map((entry) => [entry.untilTime, entry]))
     merged.set(part.untilTime, {
       untilTime: part.untilTime, markdown: part.markdown, ts: Date.now(), title: part.title,
@@ -155,7 +203,7 @@ export async function refinePendingParts(ctx, {
     }
   }
 
-  return { parts, todayParts, sessions: parts.length, fallbackCwd, date: dateOf(now) }
+  return { parts, todayParts, sessions: parts.length, fallbackCwd, date: dateOf(now), scan }
 }
 
 /**
@@ -166,19 +214,26 @@ export async function refinePendingParts(ctx, {
  * @returns {Promise<{ markdown: string, parts: object[], sessions: number }>}
  */
 export async function generateTodaySummaryStepped(ctx, { logger = console, ...options } = {}) {
-  const { parts, todayParts, sessions, fallbackCwd, date } = await refinePendingParts(ctx, { logger, ...options })
+  const startedAt = Date.now()
+  const { parts, todayParts, sessions, fallbackCwd, date, scan } = await refinePendingParts(ctx, { logger, ...options })
 
   // 汇总提示词吃的是"今天的全部片段"（留存 + 增量），不是只有本轮提炼出来的那几段
   const merged = todayParts?.length ? todayParts : parts
   const markdown = await summariseWithinLimits(ctx, {
-    prompt: buildMergePrompt(merged, { date }),
+    prompt: buildMergePrompt(merged, { date, logger }),
     cwd: fallbackCwd,
     date,
     logger,
   })
 
-  logger.info?.(`dsh-assistant: 今日总结完成（${sessions} 个会话分别提炼后汇总，${markdown.length} 字）`)
-  return { markdown, parts, sessions }
+  // 结果日志要能**对上账**：补了几段、读了多少会话、预筛跳了多少、用时多少。
+  // 只有"${'N'} 字"的时候，"日报怎么变慢了/怎么什么都没写"只能靠猜。
+  logger.info?.(
+    `dsh-assistant: 今日总结完成（${sessions} 个会话分别提炼后汇总，${markdown.length} 字`
+    + `，读 ${scan?.read ?? '?'} 个 / 预筛跳过 ${scan?.skipped ?? '?'} 个`
+    + `，用时 ${Date.now() - startedAt}ms）`,
+  )
+  return { markdown, parts, sessions, scan }
 }
 
 /**

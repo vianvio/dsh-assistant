@@ -6,12 +6,13 @@
  */
 
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 
 import {
+  MERGE_PROMPT_LIMITS,
   SUMMARY_LIMITS,
   measureReport,
   buildCorpus,
@@ -29,7 +30,7 @@ import {
 import { collectSessions, runHiddenSession, yieldToLoop } from '../src/pet-summary-agent.js'
 import { SessionDigests, projectSession } from '../src/pet-summary-digest.js'
 import { createSessionActivityIndex, touchedToday } from '../src/pet-summary-activity.js'
-import { generateTodaySummary, generateTodaySummaryStepped, refinePendingParts, summaryHint } from '../src/pet-summary.js'
+import { REFINE_CONCURRENCY, generateTodaySummary, generateTodaySummaryStepped, refinePendingParts, summaryHint } from '../src/pet-summary.js'
 import { appendPart, partsFor, readStore, storePath, summarizedUntil, writeStore } from '../src/pet-summary-store.js'
 
 const quiet = { info() {}, warn() {}, error() {}, debug() {} }
@@ -115,21 +116,26 @@ test('今日总结：单会话过长时截断，不会把 prompt 撑爆', () => 
 
 test('今日总结：增量抽取只取"今天 + 水位之后"的部分', () => {
   const now = Date.now()
-  const yesterday = now - 36 * 3600_000
+  // 时间锚点要相对**今天的 0 点**取，不能用 "now - N 小时" ——
+  // 那样在凌晨 0–2 点跑会跨过午夜，今天的事件变成"昨天"，用例随机变红（实测 01:41 挂过）
+  const since = startOfToday(now)
+  const yesterday = since - 36 * 3600_000
+  const morning = since + 3600_000
+  const noon = since + 4 * 3600_000
   const records = [
     { header: { id: 'a', createdAt: yesterday, cwd: '/p/a' } },
-    { header: { id: 'b', createdAt: now - 3600_000, cwd: '/p/b' } },
-    { header: { id: 'sub', createdAt: now - 60_000, origin: 'subagent' } },
+    { header: { id: 'b', createdAt: morning, cwd: '/p/b' } },
+    { header: { id: 'sub', createdAt: morning, origin: 'subagent' } },
     { header: { id: 'quiet', createdAt: yesterday, cwd: '/p/quiet' } },
   ]
   const snapshots = new Map([
     ['a', { events: [
       { type: 'user/message', time: yesterday, data: { source: { kind: 'user' }, content: [{ type: 'text', text: '昨天的事' }] } },
-      { type: 'user/message', time: now - 7200_000, data: { source: { kind: 'user' }, content: [{ type: 'text', text: '今天新增：改了配置' }] } },
-      { type: 'assistant/message', time: now - 7100_000, data: { message: { content: [{ type: 'text', text: '改好了' }] } } },
+      { type: 'user/message', time: morning, data: { source: { kind: 'user' }, content: [{ type: 'text', text: '今天新增：改了配置' }] } },
+      { type: 'assistant/message', time: morning + 100_000, data: { message: { content: [{ type: 'text', text: '改好了' }] } } },
     ] }],
     ['b', { events: [
-      { type: 'user/message', time: now - 3600_000, data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'B 的今天' }] } },
+      { type: 'user/message', time: noon, data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'B 的今天' }] } },
     ] }],
     ['quiet', { events: [
       { type: 'user/message', time: yesterday, data: { source: { kind: 'user' }, content: [{ type: 'text', text: '昨天说过话，今天没动' }] } },
@@ -142,12 +148,12 @@ test('今日总结：增量抽取只取"今天 + 水位之后"的部分', () => 
   const deltaA = fresh.find((delta) => delta.id === 'a')
   assert.ok(deltaA.lines.join('\n').includes('今天新增：改了配置'), '取到今天的增量')
   assert.ok(!deltaA.lines.join('\n').includes('昨天的事'), '昨天的内容不算增量')
-  assert.equal(deltaA.untilTime, now - 7100_000, '水位推进到最后一条事件时间')
+  assert.equal(deltaA.untilTime, morning + 100_000, '水位推进到最后一条事件时间')
   assert.ok(!fresh.some((delta) => delta.id === 'sub'), '子会话（自己跑总结用的）不参与')
   assert.ok(!fresh.some((delta) => delta.id === 'quiet'), '今天没更新的会话不参与')
 
-  // 水位 = 已总结到 7200_000 之前：只剩助手那句
-  const afterWatermark = extractDeltas(records, asDigests(snapshots, now), { now, summarizedUntilOf: (id) => (id === 'a' ? now - 7200_000 : 0) })
+  // 水位 = 已总结到助手那句之前：只剩助手那句
+  const afterWatermark = extractDeltas(records, asDigests(snapshots, now), { now, summarizedUntilOf: (id) => (id === 'a' ? morning : 0) })
   const remaining = afterWatermark.find((delta) => delta.id === 'a')
   assert.equal(remaining.lines.join('\n'), '【助手】改好了', '只补水位之后的部分（这就是"只总结没压缩的增量"）')
 })
@@ -161,6 +167,34 @@ test('今日总结：分段/汇总提示词各司其职', () => {
   assert.ok(mergePrompt.includes('合并同类项'), '汇总要求去重合并')
   assert.ok(mergePrompt.includes('最多'), '汇总也要有数量上限（曾经这条路径完全没有上限）')
   assert.equal(eventsToLines([{ type: 'user/message', data: { source: { kind: 'hook' }, content: [{ type: 'text', text: 'x' }] } }]).length, 0)
+})
+
+test('汇总提示词：总量封顶，且每个会话都还留着一份（不能长的挤没短的）', () => {
+  const big = (n, len) => Array.from({ length: n }, (_, i) => ({ title: `S${i + 1}`, cwd: `/p/${i + 1}`, markdown: 'x'.repeat(len) }))
+  const warnings = []
+  const logger = { warn: (line) => warnings.push(String(line)) }
+
+  // 单会话那份提炼是模型产的：一次跑飞就能把汇总提示词撑到几十万字符，
+  // 后果是最后这一步超上下文失败 —— 前面 N 次调用全白花
+  const runaway = buildMergePrompt(big(20, 9000), { date: '2026/9/20', logger })
+  assert.ok(
+    runaway.length <= MERGE_PROMPT_LIMITS.total + 2000,
+    `汇总提示词要封顶，实际 ${runaway.length} 字符（上限 ${MERGE_PROMPT_LIMITS.total}）`,
+  )
+  assert.equal(warnings.length, 1, '截断要留一条告警（否则"日报怎么少了内容"查不出来）')
+  assert.match(warnings[0], /20 个会话的提炼条目过长/u)
+
+  // 会话多到平分都不够时，也不能把后面的一刀切掉：每个会话都要留一句
+  const many = buildMergePrompt(big(200, 2000), { date: '2026/9/20' })
+  assert.ok(many.length <= MERGE_PROMPT_LIMITS.total + 20_000, `200 个会话也要封顶，实际 ${many.length}`)
+  const blocks = many.split('### ').slice(1)
+  assert.equal(blocks.length, 200, '每个会话都要留下一个分组')
+  assert.ok(blocks.every((block) => block.trim().length > 50), '不能有会话被挤成空分组')
+
+  // 正常体量一个字都不该动
+  const small = big(5, 100)
+  const prompt = buildMergePrompt(small, { date: '2026/9/20' })
+  for (const part of small) assert.ok(prompt.includes(part.markdown), '没超限就不该截断')
 })
 
 test('提示词：两套模式都带"每个分组最多 N 条 + 行数上限"，且末尾复述一遍', () => {
@@ -310,6 +344,169 @@ test('后台提炼：只提炼不留汇总（原先白花一次模型调用）',
   assert.equal(full.calls.created.length, 2, '完整路径 = 提炼 1 次 + 汇总 1 次')
 })
 
+/**
+ * 并发提炼的替身：每个会话的"模型往返"由 cwd 决定耗时，
+ * 顺便统计**同时在飞**的个数（串行时峰值恒为 1）。
+ */
+function fakeLatencyCtx({ ids, latencyOf, failOn = () => false }) {
+  const at = Date.now()
+  let inflight = 0
+  const peak = { value: 0 }
+  const seen = []
+  const agents = {
+    async create({ meta }) {
+      const id = String(meta.cwd).split('/').pop()
+      if (failOn(id)) throw new Error(`模型 500（${id}）`)
+      inflight += 1
+      peak.value = Math.max(peak.value, inflight)
+      seen.push(id)
+      await new Promise((done) => setTimeout(done, latencyOf(id)))
+      inflight -= 1
+      return {
+        agent: {
+          session: {
+            snapshotEvents: () => [{ type: 'assistant/message', data: { content: [{ type: 'text', text: `- ${id} 的提炼` }] } }],
+          },
+          followup() {},
+          whenIdle: async () => {},
+        },
+        dispose: async () => {},
+      }
+    },
+  }
+  return {
+    peak,
+    seen,
+    ctx: {
+      get: (name) => ({
+        agents,
+        sessions: { flush: async () => {} },
+        sessionQuery: {
+          async listSessions() { return ids.map((id) => ({ header: { id, createdAt: at, cwd: `/p/${id}` } })) },
+          async readSession(id) {
+            return { events: [
+              { type: 'user/message', time: at, data: { source: { kind: 'user' }, content: [{ type: 'text', text: `干活 ${id}` }] } },
+            ] }
+          },
+          async readSurface() { return undefined },
+          async readTitleSnapshots(list) {
+            return list.map((sessionId) => ({ sessionId, status: 'fulfilled', value: { title: { title: `会话${sessionId}` } } }))
+          },
+          async readTitle() { return { title: undefined } },
+        },
+      }[name]),
+    },
+  }
+}
+
+test('提炼并发：多个会话并行跑（有上限），顺序与串行时一致', async () => {
+  const now = Date.now()
+  const ids = Array.from({ length: 12 }, (_, i) => `s${i + 1}`)
+  const storeFile = join(tmpdir(), `dsh-assistant-conc-${Date.now()}.json`)
+  // 越靠后的会话越快返回 —— 完成顺序与下发顺序相反，专门用来验证"分段顺序不能跟着乱"
+  const { ctx, peak, seen } = fakeLatencyCtx({
+    ids,
+    latencyOf: (id) => 10 + (12 - Number(id.slice(1))) * 3,
+  })
+
+  // 同一批会话先串行跑一遍做基线：**相对比较**而不是绝对毫秒数
+  //（整个套件是并行跑的，绝对耗时在负载高时会飘）
+  const serialStart = Date.now()
+  await refinePendingParts(
+    fakeLatencyCtx({ ids, latencyOf: (id) => 10 + (12 - Number(id.slice(1))) * 3 }).ctx,
+    { logger: quiet, now, storeFile: join(tmpdir(), `dsh-assistant-conc-base-${Date.now()}.json`), concurrency: 1 },
+  )
+  const serialMs = Date.now() - serialStart
+
+  const progress = []
+  const started = Date.now()
+  const result = await refinePendingParts(ctx, {
+    logger: quiet, now, storeFile, onPart: ({ index, total }) => progress.push([index, total]),
+  })
+  const elapsed = Date.now() - started
+
+  assert.equal(result.parts.length, 12)
+  assert.equal(seen.length, 12, '每个会话都要提炼一次')
+  assert.equal(peak.value, REFINE_CONCURRENCY, `并发峰值应等于上限 ${REFINE_CONCURRENCY}，实际 ${peak.value}`)
+  assert.ok(
+    elapsed < serialMs * 0.6,
+    `并行后不该还要等满 12 次往返：串行基线 ${serialMs}ms，并行实际 ${elapsed}ms`,
+  )
+
+  // 分段顺序 = 会话顺序（按下标落位），不跟完成顺序走
+  assert.deepEqual(result.parts.map((part) => part.id), ids, '分段顺序必须与会话顺序一致（两次跑要出同一版）')
+  assert.deepEqual(progress.map(([index]) => index), ids.map((_, i) => i + 1), '进度回调的下标是下发顺序')
+  assert.ok(progress.every(([, total]) => total === 12))
+
+  // 关掉并发 = 旧行为（也是给"模型侧限流"留的旋钮）
+  const serial = fakeLatencyCtx({ ids: ids.slice(0, 4), latencyOf: () => 3 })
+  await refinePendingParts(serial.ctx, {
+    logger: quiet, now, storeFile: join(tmpdir(), `dsh-assistant-serial-${Date.now()}.json`), concurrency: 1,
+  })
+  assert.equal(serial.peak.value, 1, 'concurrency: 1 时逐个跑')
+})
+
+test('提炼并发：一个会话失败不影响同一批的其它会话', async () => {
+  const now = Date.now()
+  const storeFile = join(tmpdir(), `dsh-assistant-conc-fail-${Date.now()}.json`)
+  const { ctx } = fakeLatencyCtx({
+    ids: ['good1', 'bad', 'good2'],
+    latencyOf: () => 2,
+    failOn: (id) => id === 'bad',
+  })
+
+  const warned = []
+  const result = await refinePendingParts(ctx, {
+    logger: { ...quiet, warn: (line) => warned.push(String(line)) }, now, storeFile,
+  })
+
+  assert.deepEqual(result.parts.map((part) => part.id), ['good1', 'good2'], '失败的会话被跳过，其它照常产出')
+  assert.equal(warned.length, 1, `失败要留一条告警，实际: ${JSON.stringify(warned)}`)
+  assert.match(warned[0], /bad/u)
+  assert.match(warned[0], /模型 500/u, '告警要带失败原因')
+})
+
+test('日志级别：跑一次日报只留一条 info，且那条带得动账（逐会话日志在 debug 上）', async () => {
+  const now = Date.now()
+  const ids = ['a', 'b', 'c']
+  const records = ids.map((id) => ({ header: { id, createdAt: now - 1000, cwd: `/p/${id}` } }))
+  const snapshots = new Map(ids.map((id) => [id, { events: [
+    { type: 'user/message', time: now, data: { source: { kind: 'user' }, content: [{ type: 'text', text: `干活 ${id}` }] } },
+  ] }]))
+  const { ctx, calls } = fakeCtx({ records, snapshots, titles: new Map(), answers: ['- 一条', '- 一条', '- 一条', '## 今天做了什么\n- 合并'] })
+  const logs = []
+  const logger = {
+    debug: (line) => logs.push(['debug', String(line)]),
+    info: (line) => logs.push(['info', String(line)]),
+    warn: (line) => logs.push(['warn', String(line)]),
+    error: (line) => logs.push(['error', String(line)]),
+  }
+
+  const result = await generateTodaySummaryStepped(ctx, {
+    logger, now, storeFile: join(tmpdir(), `dsh-assistant-log-${Date.now()}.json`),
+  })
+
+  // 一次日报要开 N+1 个隐藏会话：这些"已启动"落在 info 上就是每跑一次刷 N 行
+  const infos = logs.filter(([level]) => level === 'info').map(([, line]) => line)
+  assert.equal(infos.length, 1, `只该有一条 info，实际 ${JSON.stringify(infos)}`)
+  assert.match(infos[0], /今日总结完成/u)
+  // 账要能对上：会话数、字数、读了多少、跳过多少、用时
+  assert.match(infos[0], new RegExp(`\\b3 个会话`, 'u'))
+  assert.match(infos[0], /\d+ 字/u)
+  assert.match(infos[0], /读 \d+ 个 \/ 预筛跳过 \d+ 个/u)
+  assert.match(infos[0], /用时 \d+ms/u)
+
+  const started = logs.filter(([level, line]) => level === 'debug' && /总结会话已启动/u.test(line))
+  assert.equal(started.length, calls.created.length, '每个隐藏会话启动都记一笔（但只在 debug 上）')
+  assert.equal(calls.created.length, 4, '3 个会话 + 1 次汇总')
+
+  // 结果对象里也带同一份账（不是只有日志里能看）
+  assert.equal(result.scan.read, 3)
+  assert.equal(result.scan.sessions, 3)
+  assert.equal(typeof result.scan.elapsedMs, 'number')
+  assert.ok(result.scan.elapsedMs >= 0)
+})
+
 test('后台提炼：水位之后只补增量（压缩过的那段不再重提炼）', async () => {
   const now = Date.now()
   const earlier = now - 3600_000
@@ -319,7 +516,7 @@ test('后台提炼：水位之后只补增量（压缩过的那段不再重提�
     { type: 'user/message', time: now - 1000, data: { source: { kind: 'user' }, content: [{ type: 'text', text: '压缩后新增' }] } },
   ] }]])
   const storeFile = join(tmpdir(), `dsh-assistant-delta-${Date.now()}.json`)
-  appendPart({ sessionId: 'a', title: '会话A', cwd: '/p/a', untilTime: earlier + 1, markdown: '- 之前提炼过的' }, storeFile)
+  await appendPart({ sessionId: 'a', title: '会话A', cwd: '/p/a', untilTime: earlier + 1, markdown: '- 之前提炼过的' }, storeFile)
 
   const { ctx, calls } = fakeCtx({ records, snapshots, titles: new Map([['a', '会话A']]), answers: ['- 只补这段'] })
   await refinePendingParts(ctx, { logger: quiet, now, storeFile })
@@ -449,7 +646,7 @@ test('扫描：每个会话之间把事件循环让出去（否则宿主心跳�
 
 /* ------------------------------------------------- 首轮预筛（mtime 索引，D） */
 
-test('预筛：按目录名能定位到会话文件（两种命名都要认）', () => {
+test('预筛：按目录名能定位到会话文件（两种命名都要认）', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-assistant-activity-'))
   try {
     const root = join(dir, 'sessions')
@@ -465,7 +662,10 @@ test('预筛：按目录名能定位到会话文件（两种命名都要认）',
     write('--Users-vian-Documents-b--', 'session-bbbb-2222', 'session.jsonl.zstd', old) // v0：带前缀
     write('--Users-vian-Documents-c--', 'cccc-3333', 'session.v3.jsonl.zstd', old)
 
-    const index = createSessionActivityIndex({ root, now: () => today })
+    const index = createSessionActivityIndex({ root, now: () => today, logger: quiet })
+    // 构建是后台的：结果没落地之前一律 undefined（= 调用方照读，只慢不漏）
+    assert.equal(index.mtimeOf('aaaa-1111'), undefined, '索引还没建好 → 没有信号（不是"没动过"）')
+    await index.ready()
     assert.equal(index.mtimeOf('aaaa-1111'), today, 'v3 裸 id 能定位')
     assert.equal(index.mtimeOf('bbbb-2222'), old, '给不带前缀的 id 也要能定位到带前缀的目录')
     assert.equal(index.mtimeOf('session-bbbb-2222'), old, '带前缀的 id 同样能定位')
@@ -473,9 +673,72 @@ test('预筛：按目录名能定位到会话文件（两种命名都要认）',
     assert.equal(index.stats.entries, 3)
 
     // 目录不存在（比如换了 DSH_HOME）：没有信号，不是错误
-    const missing = createSessionActivityIndex({ root: join(dir, 'nowhere'), now: () => today })
+    const missing = createSessionActivityIndex({ root: join(dir, 'nowhere'), now: () => today, logger: quiet })
+    await missing.ready()
     assert.equal(missing.mtimeOf('aaaa-1111'), undefined)
     assert.equal(missing.stats.entries, 0)
+    assert.equal(missing.stats.failures, 0, '目录不存在是预期情况，不算失败')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('预筛：索引在后台建（不在调用方的事件循环里走目录树），失败可见', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-assistant-activity-async-'))
+  try {
+    const root = join(dir, 'sessions')
+    const today = Date.now()
+    // 200 个会话目录 × 3 个文件：同步走一遍是几十毫秒的硬卡顿
+    for (let i = 0; i < 200; i += 1) {
+      const sessionDir = join(root, `--ws-${i % 5}--`, `sess-${i}`)
+      mkdirSync(sessionDir, { recursive: true })
+      for (const name of ['session.jsonl.zstd', 'session.jsonl.zstd.1', 'x.log']) {
+        const path = join(sessionDir, name)
+        writeFileSync(path, 'x')
+        utimesSync(path, today / 1000, today / 1000)
+      }
+    }
+    // 一个 zstd 是**断链**：stat 会 ENOENT —— 必须记账，不能静默吞掉（以前是空 catch）
+    symlinkSync(join(root, '不存在'), join(root, '--ws-0--', 'sess-0', 'dead.jsonl.zstd'))
+    // workspace 位置放个文件：不是目录，按规矩忽略（不该算失败，也不该影响别人）
+    writeFileSync(join(root, '--not-a-dir--'), 'x')
+
+    const warnings = []
+    const index = createSessionActivityIndex({
+      root, now: () => today, logger: { debug() {}, warn: (line) => warnings.push(String(line)) },
+    })
+
+    // ① 冷索引上的第一次查询必须立刻返回（旧实现就地走一遍目录树，几百次 stat）
+    const started = performance.now()
+    assert.equal(index.mtimeOf('sess-1'), undefined, '结果没落地前没有信号（照读）')
+    const elapsed = performance.now() - started
+    assert.ok(elapsed < 25, `mtimeOf 不该等目录树走完，实际 ${elapsed.toFixed(1)}ms`)
+
+    // ② 构建期间事件循环照常转：同步走树时一次都转不了
+    let ticks = 0
+    const timer = setInterval(() => { ticks += 1 }, 1)
+    await index.ready()
+    clearInterval(timer)
+    assert.ok(ticks >= 3, `构建期间要让出事件循环，实际只跳了 ${ticks} 次`)
+
+    // ③ 结果正确；一个坏目录不该把整份索引带走
+    assert.equal(index.mtimeOf('sess-7'), today, '建好后能定位')
+    assert.equal(index.stats.entries, 200, '坏的 workspace 只影响它自己')
+    assert.ok(index.stats.failures >= 1, '读目录失败要记账（以前是空 catch）')
+    assert.match(index.stats.firstFailure, /ENOENT/u, '要记下首个原因')
+    assert.equal(warnings.length, 1, `失败要留一条汇总，实际 ${JSON.stringify(warnings)}`)
+    assert.match(warnings[0], /跳过 \d+ 项、失败 \d+ 次/u)
+    assert.match(warnings[0], /ENOENT/u)
+
+    // ④ 过期重建也是后台的：查询照样立刻返回，这一轮继续用上一份
+    const later = today + 60_000
+    const stale = createSessionActivityIndex({
+      root, now: () => later, logger: { debug() {}, warn: (line) => warnings.push(String(line)) },
+    })
+    await stale.ready()
+    const again = performance.now()
+    stale.mtimeOf('sess-1')
+    assert.ok(performance.now() - again < 25, '过期后的查询也不能就地重建')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -546,18 +809,19 @@ test('结果页提示：后台总结关着（默认）时给一行开关说明�
 
 /* ------------------------------------------------------- 水位存储 */
 
-test('水位存储：写入后可读回，同水位覆盖不重复拼接', () => {
+test('水位存储：写入后可读回，同水位覆盖不重复拼接', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-assistant-store-'))
   const file = join(dir, 'summaries.json')
   try {
     assert.equal(summarizedUntil('s1', file), 0, '没有留存时水位是 0')
-    appendPart({ sessionId: 's1', title: '会话一', untilTime: 100, markdown: '第一段' }, file)
-    appendPart({ sessionId: 's1', title: '会话一', untilTime: 200, markdown: '第二段' }, file)
-    assert.equal(summarizedUntil('s1', file), 200)
+    const base = Date.now() - 7200_000
+    await appendPart({ sessionId: 's1', title: '会话一', untilTime: base, markdown: '第一段' }, file)
+    await appendPart({ sessionId: 's1', title: '会话一', untilTime: base + 1000, markdown: '第二段' }, file)
+    assert.equal(summarizedUntil('s1', file), base + 1000)
     assert.deepEqual(partsFor('s1', file).map((part) => part.markdown), ['第一段', '第二段'])
 
     // 压缩可能重复触发：同一水位重写要覆盖，不能拼出重复内容
-    appendPart({ sessionId: 's1', title: '会话一', untilTime: 200, markdown: '第二段（改）' }, file)
+    await appendPart({ sessionId: 's1', title: '会话一', untilTime: base + 1000, markdown: '第二段（改）' }, file)
     assert.deepEqual(partsFor('s1', file).map((part) => part.markdown), ['第一段', '第二段（改）'])
     assert.equal(readStore(file).version, 1)
   } finally {
@@ -706,12 +970,14 @@ test('增量：半损坏的水位文件不会让下一次总结抛错', async ()
   const storeFile = join(dir, 'summaries.json')
   writeFileSync(storeFile, JSON.stringify({ version: 1, sessions: { a: { title: 'A' } } }))
 
-  assert.equal(appendPart({ sessionId: 'a', title: 'A', cwd: '/p', untilTime: 5, markdown: '- x' }, storeFile), true)
-  assert.deepEqual(partsFor('a', storeFile).map((part) => part.untilTime), [5], '缺 parts 的记录按空处理后再写')
+  const t1 = Date.now() - 60_000
+  assert.equal(await appendPart({ sessionId: 'a', title: 'A', cwd: '/p', untilTime: t1, markdown: '- x' }, storeFile), true)
+  assert.deepEqual(partsFor('a', storeFile).map((part) => part.untilTime), [t1], '缺 parts 的记录按空处理后再写')
 
   writeFileSync(storeFile, JSON.stringify({ version: 1, sessions: { a: { title: 'A', parts: 'oops' } } }))
-  assert.equal(appendPart({ sessionId: 'a', title: 'A', cwd: '/p', untilTime: 7, markdown: '- y' }, storeFile), true)
-  assert.deepEqual(partsFor('a', storeFile).map((part) => part.untilTime), [7], 'parts 不是数组也按空处理')
+  const t2 = Date.now() - 30_000
+  assert.equal(await appendPart({ sessionId: 'a', title: 'A', cwd: '/p', untilTime: t2, markdown: '- y' }, storeFile), true)
+  assert.deepEqual(partsFor('a', storeFile).map((part) => part.untilTime), [t2], 'parts 不是数组也按空处理')
 })
 
 test('执行层：agents.create 抛错时不留定时器（否则会把宿主进程拖着不退出）', async () => {
@@ -782,7 +1048,7 @@ test('增量：磁盘上留存的片段也必须进汇总提示词（不是只�
   const storeFile = join(dir, 'summaries.json')
 
   // 磁盘上已经留了一段"上午"的（模拟会话压缩时后台提炼过）
-  appendPart({ sessionId: 'a', title: '会话A', cwd: '/p/a', untilTime: earlier + 1, markdown: '- 上午：做了A' }, storeFile)
+  await appendPart({ sessionId: 'a', title: '会话A', cwd: '/p/a', untilTime: earlier + 1, markdown: '- 上午：做了A' }, storeFile)
 
   // 今天又新增了一条 → 增量只覆盖"下午"
   const records = [{ header: { id: 'a', createdAt: earlier, cwd: '/p/a' } }]
@@ -799,4 +1065,143 @@ test('增量：磁盘上留存的片段也必须进汇总提示词（不是只�
   const mergePrompt = calls.prompts.at(-1)
   assert.match(mergePrompt, /上午：做了A/, '磁盘留存的片段必须进汇总提示词')
   assert.match(mergePrompt, /下午：做了B/, '本轮的增量也要在')
+})
+
+test('水位存储：一次批量写（N 段只读写整份各一次），不再逐段放大', async () => {
+  const { mkdtempSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { appendParts, storeIO, resetStoreIO } = await import('../src/pet-summary-store.js')
+
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-assistant-batch-'))
+  const file = join(dir, 'summaries.json')
+  const base = Date.now() - 3600_000
+  // 先造 20 个历史会话，模拟"攒了很多天"
+  await appendParts(Array.from({ length: 20 }, (_, index) => ({
+    sessionId: `old-${index}`, title: `旧${index}`, cwd: '/p', untilTime: base, markdown: '- 历史片段',
+  })), file)
+
+  resetStoreIO()
+  const touched = await appendParts(Array.from({ length: 20 }, (_, index) => ({
+    sessionId: `t-${index}`, title: `t${index}`, cwd: '/p', untilTime: base + 1000 + index, markdown: '- 本轮提炼',
+  })), file)
+
+  assert.equal(touched, 20)
+  assert.equal(storeIO.writes, 1, `整份只该写一次，实际 ${storeIO.writes} 次`)
+  assert.equal(storeIO.reads, 1, `整份只该读一次，实际 ${storeIO.reads} 次`)
+  assert.ok(storeIO.writeBytes < 200_000, `写出量应与新增数据同量级，实际 ${storeIO.writeBytes} 字节`)
+  assert.equal(partsFor('t-19', file).length, 1, '20 段都落进去了')
+})
+
+test('水位存储：裁剪有界（保窗口 + 每会话上限，且永远留住水位那一段）', async () => {
+  const { mkdtempSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { appendParts, partsFor } = await import('../src/pet-summary-store.js')
+
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-assistant-trim-'))
+  const file = join(dir, 'summaries.json')
+  const now = Date.now()
+
+  // ① 同一个会话写 260 段 → 最多留 200 段，且保留的是**最新的**
+  await appendParts(Array.from({ length: 260 }, (_, index) => ({
+    sessionId: 'hot', title: '热门', cwd: '/p', untilTime: now - (260 - index) * 60_000, markdown: `- 第 ${index} 段`,
+  })), file)
+  const kept = partsFor('hot', file)
+  assert.ok(kept.length <= 200, `每会话上限失效：${kept.length} 段`)
+  assert.equal(kept[kept.length - 1].markdown, '- 第 259 段', '保留最新的那些')
+
+  // ② 只有陈旧片段的会话：窗口外的丢掉，但**至少留最新一段**（它就是水位）
+  await appendParts([
+    { sessionId: 'stale', title: '陈旧', cwd: '/p', untilTime: now - 100 * 86400_000, markdown: '- 很久以前' },
+    { sessionId: 'stale', title: '陈旧', cwd: '/p', untilTime: now - 99 * 86400_000, markdown: '- 稍近一点' },
+  ], file)
+  const stale = partsFor('stale', file)
+  assert.equal(stale.length, 1, '窗口外的都裁掉，只留最新一段当水位')
+  assert.equal(stale[0].markdown, '- 稍近一点')
+})
+
+test('水位存储：锁的三种情形（活着的持有者不被抢 / 卡死才夺锁 / 进程没了就接管）', async () => {
+  const { mkdtempSync, rmSync, utimesSync, writeFileSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { spawn } = await import('node:child_process')
+  const { appendParts, readStore } = await import('../src/pet-summary-store.js')
+
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-assistant-lock-'))
+  const part = { sessionId: 'A', title: 'A', cwd: '/p', untilTime: Date.now(), markdown: '- 一条' }
+  const ageLock = (lock, ms) => {
+    const seconds = (Date.now() - ms) / 1000
+    utimesSync(lock, seconds, seconds)
+  }
+  const logs = []
+  const logger = { debug() {}, info() {}, warn: (line) => logs.push(String(line)) }
+
+  try {
+    // ① 持锁进程还活着、锁很新 → **不许抢**，等到超时就放弃（以前这里是"锁够老就夺"，
+    //    而"够老"只看 mtime：一个正在慢慢写盘的持有者会被别人把锁拿走，两边一起写）
+    const live = join(dir, 'live.json')
+    writeFileSync(`${live}.lock`, `${process.pid}\n`)
+    await assert.rejects(
+      () => appendParts([part], live, { logger, timeoutMs: 60 }),
+      /被占用/u,
+      '活着的持有者不该被夺锁',
+    )
+    assert.ok(!readStore(live, { logger: { debug() {}, warn() {} } }).sessions.A, '放弃写入就是真的没写')
+
+    // ② 持锁者活着但锁已经 10 分钟没动（卡死）→ 才允许接管
+    const wedged = join(dir, 'wedged.json')
+    writeFileSync(`${wedged}.lock`, `${process.pid}\n`)
+    ageLock(`${wedged}.lock`, 10 * 60 * 1000)
+    await appendParts([part], wedged, { logger, timeoutMs: 60 })
+    assert.equal(readStore(wedged).sessions.A?.parts?.length, 1, '卡死的持有者要被接管，写入照常完成')
+    assert.ok(logs.some((line) => /锁是陈旧的.*已接管/u.test(line)), `接管要留一条日志，实际 ${JSON.stringify(logs)}`)
+
+    // ③ 持锁进程已经退出（ESRCH）→ 立刻接管
+    const gone = join(dir, 'gone.json')
+    const dead = spawn(process.execPath, ['-e', '0'])
+    await new Promise((done) => dead.on('exit', done))
+    writeFileSync(`${gone}.lock`, `${dead.pid}\n`)
+    await appendParts([part], gone, { logger, timeoutMs: 60 })
+    assert.equal(readStore(gone).sessions.A?.parts?.length, 1, '死掉的持有者留下的锁要能立刻接管')
+
+    // ④ 锁里读不出 pid（只写了一半）：新鲜的不抢（持有者可能正在写），够老了才接管
+    const junk = join(dir, 'junk.json')
+    writeFileSync(`${junk}.lock`, 'not-a-pid')
+    await assert.rejects(
+      () => appendParts([part], junk, { logger, timeoutMs: 60 }),
+      /被占用/u,
+      '读不出 pid 的新锁也不能抢（持有者可能刚 open 还没写完）',
+    )
+    ageLock(`${junk}.lock`, 30_000)
+    await appendParts([part], junk, { logger, timeoutMs: 60 })
+    assert.equal(readStore(junk).sessions.A?.parts?.length, 1, '读不出 pid 的老锁按年龄判：够老就接管')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('水位存储：读失败要说话（首次运行静默 debug；坏了/读不动要 warn）', async () => {
+  const { mkdtempSync, writeFileSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { readStore } = await import('../src/pet-summary-store.js')
+
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-assistant-readfail-'))
+  const file = join(dir, 'summaries.json')
+  const events = []
+  const logger = { info() {}, debug: (line) => events.push(['debug', line]), warn: (line) => events.push(['warn', line]), error() {} }
+
+  // ① 文件不存在 → 不该 warn（首次运行是正常的）
+  assert.deepEqual(readStore(file, { logger }).sessions, {})
+  assert.equal(events.filter(([level]) => level === 'warn').length, 0, '首次运行不该报 warn')
+  assert.equal(events.filter(([level]) => level === 'debug').length, 1, '留一条 debug 就够')
+
+  // ② 坏 JSON → 必须 warn，且带路径
+  writeFileSync(file, '{ 这不是 json')
+  assert.deepEqual(readStore(file, { logger }).sessions, {})
+  const warn = events.filter(([level]) => level === 'warn').map(([, line]) => line)
+  assert.equal(warn.length, 1, '坏文件要留一条 warn')
+  assert.ok(warn[0].includes(file), 'warn 里要有路径')
+
+  // ③ 结构不符 → 也要 warn
+  writeFileSync(file, JSON.stringify({ version: 99, sessions: {} }))
+  readStore(file, { logger })
+  assert.equal(events.filter(([level]) => level === 'warn').length, 2, '版本不符也要 warn')
 })

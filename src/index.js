@@ -52,7 +52,7 @@ export async function apply(ctx, config = {}) {
         const dispose = webServer.register({
           kind: 'prefix',
           path: CONFIG_ENDPOINT,
-          handler: createConfigHandler(settings, () => pet),
+          handler: createConfigHandler(settings, () => pet, logger),
         })
         httpCtx.effect(() => dispose, 'dsh-assistant: 本地设置与互动端点')
       })

@@ -106,13 +106,19 @@ test('集成：真实 DSH 设置服务下，配置能注册、能读写、能落
   assert.equal(bad.state.status, 400)
   assert.equal(provider.get('dsh-assistant')['乱写'], undefined)
 
-  // 全程只该有"缺 helper"这一类告警：
+  // ④ 那次故意写坏字段，**必须**在日志里留下一条（这条链路以前是静默的：
+  // "面板存不上"排查时日志里一个字都没有）。顺手把组合根有没有把 logger 交下去也验了。
+  const rejects = warnings.filter((line) => /拒绝 400 PATCH/.test(line))
+  assert.equal(rejects.length, 1, `故意写坏字段要留一条拒绝日志，实际: ${JSON.stringify(warnings)}`)
+  assert.match(rejects[0], /乱写/u, '拒绝日志要能看出是哪个字段')
+
+  // 其它只该有"缺 helper"这一类告警：
   //   · 它是预期的（测试刻意把 DSH_ASSISTANT_HELPER 指向不存在的路径）；
   //   · 写设置会再触发一次 startProcess（helper 补齐后不重启 DSH 也能起来），
   //     所以出现两次是正常的。
   // 真正要守的是**没有**设置链路相关的告警（注册失败 / 写回失败 / namespace 用错）。
   assert.deepEqual(
-    warnings.filter((line) => !/缺少原生 helper/.test(line)),
+    warnings.filter((line) => !/缺少原生 helper/.test(line) && !rejects.includes(line)),
     [],
     `设置链路不该有告警: ${warnings.join(' / ')}`,
   )

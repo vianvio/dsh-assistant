@@ -394,7 +394,8 @@ export function probeHelper(helperPath, { assetRoot, timeoutMs = 8000 } = {}) {
       if (settled) return
       settled = true
       clearTimeout(timer)
-      try { child.kill() } catch {}
+      // 探测收尾：进程可能已经自己退了，杀不到不是问题（也不该影响这次探测的结果）
+      try { child.kill() } catch { /* 已经退了 */ }
       resolveProbe(result)
     }
     const timer = setTimeout(() => finish({ ok: false, reason: 'timeout', seen }), timeoutMs)
@@ -458,7 +459,8 @@ export function probeProtocol(helperPath, { assetRoot, timeoutMs = 8000 } = {}) 
       if (settled) return
       settled = true
       clearTimeout(timer)
-      try { child.kill() } catch {}
+      // 探测收尾：进程可能已经自己退了，杀不到不是问题（也不该影响这次探测的结果）
+      try { child.kill() } catch { /* 已经退了 */ }
       resolveProbe({ seen, errors, ...result })
     }
     const timer = setTimeout(() => finish({ ok: false, reason: 'timeout' }), timeoutMs)
