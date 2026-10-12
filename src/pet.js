@@ -20,6 +20,7 @@ import {
 import { PetMessageKind, PetState, createMessage } from './protocol.js'
 import { noticeMessage } from './pet-reducer.js'
 import { NATIVE_FIELDS, WRITABLE_FIELDS, normalizeField } from './pet-settings.js'
+import { createWindowRaiser } from './pet-window.js'
 
 /**
  * 挂载桌面宠物。
@@ -30,10 +31,12 @@ import { NATIVE_FIELDS, WRITABLE_FIELDS, normalizeField } from './pet-settings.j
  * @param {any} [options.eventCtx] 事件总线（默认 ctx.root ?? ctx）
  * @param {object} [options.logger]
  * @param {{ processOptions?: object, version?: string }} [options.tuning]
+ * @param {() => boolean} [options.raiseWindow] 把 DSH 窗口抬到最前（默认见 pet-window.js；测试可注入）
  * @returns {PetHandle}
  */
-export function mountPet({ ctx, settings, eventCtx, logger = console, tuning = {} } = {}) {
+export function mountPet({ ctx, settings, eventCtx, logger = console, tuning = {}, raiseWindow } = {}) {
   if (!settings) throw new TypeError('mountPet 需要 settings 作用域（见 createSettingsScope）')
+  const raise = raiseWindow ?? createWindowRaiser(logger)
 
   let process
   let reducer
@@ -167,6 +170,9 @@ export function mountPet({ ctx, settings, eventCtx, logger = console, tuning = {
       if (action === 'notice-open-session') {
         const sessionId = String(message.sessionId ?? '')
         if (sessionId) openSession(sessionId)
+        // 光切会话不够：窗口还压在别的 app 后面等于没切。宿主就在 Electron 主进程里，
+        // 顺手把窗口抬起来（网页版没有窗口可抬，那边靠客户端自己的 window.focus）。
+        if (!raise()) logger.debug?.('dsh-assistant: 当前环境没有可抬起的 DSH 窗口')
       }
       return
     }

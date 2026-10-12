@@ -6,19 +6,15 @@
  */
 
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
 import { test } from 'node:test'
 
 import { mountPet } from '../src/pet.js'
 import { createMemoryScope, defaults } from '../src/pet-settings.js'
+import { fakeHelper, fakePetContext, helperTuning, quietLogger, waitFor } from './helpers/pet-harness.mjs'
 
 test('通知对账：原生上报"这些通知我这边没了" → 宿主账本跟着清', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'pet-notice-drop-'))
-  const script = join(dir, 'fake-helper.mjs')
   // 假 helper：ready → 每收到一条 notice，就把它当成"我本地丢了"回报给宿主
-  writeFileSync(script, `
+  const helper = fakeHelper(`
 const out = (p) => process.stdout.write(JSON.stringify({ v: 1, kind: 'interaction', ...p }) + '\\n')
 process.stdout.write(JSON.stringify({ v: 1, kind: 'ready' }) + '\\n')
 process.stdin.setEncoding('utf8')
@@ -38,32 +34,17 @@ process.stdin.on('data', (chunk) => {
 })
 `)
 
-  const listeners = new Map()
-  const quiet = { info() {}, warn() {}, error() {}, debug() {} }
-  const ctx = {
-    logger: quiet,
-    root: undefined,
-    get: () => undefined,
-    on(event, handler) {
-      const list = listeners.get(event) ?? []
-      list.push(handler)
-      listeners.set(event, list)
-      return () => listeners.set(event, list.filter((entry) => entry !== handler))
-    },
-    effect: (callback) => callback(),
-  }
-  ctx.root = ctx
-
+  const { ctx, listeners } = fakePetContext()
   const pet = mountPet({
     ctx,
     settings: createMemoryScope(defaults),
     eventCtx: ctx,
-    logger: quiet,
-    tuning: { processOptions: { helperPath: process.execPath, args: [script], heartbeatMs: 100000 } },
+    logger: quietLogger,
+    tuning: helperTuning(helper.script),
   })
 
   try {
-    await new Promise((done) => setTimeout(done, 200))
+    assert.ok(await waitFor(() => pet.isRunning), '假 helper 应该起来了')
     const zones = listeners.get('session/event') ?? []
     assert.ok(zones.length > 0, '宿主必须订阅 session/event')
 
@@ -74,15 +55,11 @@ process.stdin.on('data', (chunk) => {
     assert.equal(posted.length, 1, `跑完一轮应该挂一条通知（实际 ${posted.length} 条）`)
 
     // 假 helper 收到 notice 后立刻回报 notice-dropped → 宿主账本必须跟着清
-    let cleared = false
-    for (let index = 0; index < 100 && !cleared; index += 1) {
-      await new Promise((done) => setTimeout(done, 50))
-      cleared = pet.notices().length === 0
-    }
+    const cleared = await waitFor(() => pet.notices().length === 0, { timeoutMs: 5000 })
     assert.equal(cleared, true, `宿主账本没跟着清（还挂着 ${pet.notices().map((n) => n.id).join(',')}）`)
   } finally {
     pet.stop()
-    rmSync(dir, { recursive: true, force: true, maxRetries: 5 })
+    helper.cleanup()
   }
 })
 
