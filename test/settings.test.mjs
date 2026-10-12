@@ -20,6 +20,7 @@ import {
   createSettingsScope,
   defaults,
   publicConfig,
+  readConfig,
 } from '../src/pet-settings.js'
 import { CONFIG_ENDPOINT, PENDING_ENDPOINT, VIEWED_ENDPOINT, createConfigHandler } from '../src/pet-endpoint.js'
 
@@ -70,7 +71,8 @@ test('设置：组合配置只认白名单字段，schema 描述齐全', () => {
   assert.ok(WRITABLE_FIELDS.includes('scale'))
   assert.ok(WRITABLE_FIELDS.includes('backgroundSummary'))
   if (PetConfig) {
-    const resolved = PetConfig({ scale: 0.55, 乱写: 1 })
+    // 0.2 起字段是 volatile 引用（{ get() }），读值统一走 readConfig（插件自己也用它）
+    const resolved = readConfig(PetConfig({ scale: 0.55, 乱写: 1 }))
     assert.equal(resolved.scale, 0.55)
     assert.equal(typeof PetConfig.toJSON(), 'object', 'schema 要能被设置页序列化')
   }
@@ -184,6 +186,119 @@ test('设置作用域：服务拒绝注册时退回内存，不把插件带走',
   assert.equal(scope.get().scale, 0.8)
 })
 
+/* ------------------------------- DSH 0.2 的设置服务（namespace = profile 条目 id） */
+
+/**
+ * 假 0.2 设置服务：真服务（`dsh-settings` 的 SettingsForms）里我们用到的语义只有两条 ——
+ *   · `describe()` 按**条目 id** 报出用户层（profile 补丁里那一段）与当前值；
+ *   · `update(ns, patch)` 把补丁写进用户层，并由 Loader 就地换掉运行中的 volatile 引用。
+ * 这里把"引用"实现成读同一份 live 对象，于是写入之后插件读到的就是新值 —— 与真服务一致。
+ */
+function fakeEntryProvider(initial = {}) {
+  const live = { ...initial }
+  const user = {}
+  let revision = 0
+  return {
+    live,
+    calls: [],
+    describe() {
+      return [{ ns: 'dsh-assistant', user: { ...user }, value: { ...live }, base: {}, revision, applies: 'live' }]
+    },
+    async update(ns, patch, expectedRevision) {
+      this.calls.push(['update', ns, patch, expectedRevision])
+      if (typeof ns !== 'string' || ns === '') throw new Error(`settings namespace "${ns}" is not registered`)
+      if (ns !== 'dsh-assistant') throw new Error(`No configurable plugin entry "${ns}"`)
+      for (const [key, value] of Object.entries(patch)) {
+        user[key] = value
+        live[key] = value // 真服务由 Loader 提交进引用，这里等价地改掉 live
+      }
+      revision += 1
+    },
+  }
+}
+
+test('设置作用域（0.2）：条目 id 就是 namespace，读引用、写走 settings.update', async () => {
+  const provider = fakeEntryProvider({ scale: 0.55, soundEnabled: true })
+  // 插件拿到的那份配置：字段是 volatile 引用（{ get() }），像 Loader 解析出来的一样
+  const config = {
+    scale: { get: () => provider.live.scale },
+    soundEnabled: { get: () => provider.live.soundEnabled },
+    autoInteractSeconds: { get: () => provider.live.autoInteractSeconds ?? 10 },
+  }
+  const ctx = { settings: provider, fiber: { entry: { options: { id: 'dsh-assistant' } } } }
+  const scope = createSettingsScope(ctx, config, console)
+
+  assert.equal(scope.source, 'service')
+  assert.equal(scope.entry, 'dsh-assistant', 'namespace 取自 profile 条目 id')
+  assert.equal(scope.get().scale, 0.55, '读的是引用里的当前值')
+  assert.equal(scope.get().soundEnabled, true)
+
+  const next = await scope.update({ scale: 0.75, 乱写: 1 })
+  assert.equal(next.scale, 0.75)
+  assert.equal(scope.get().scale, 0.75, 'update 返回时引用已经是新值')
+  assert.deepEqual(provider.calls, [['update', 'dsh-assistant', { scale: 0.75 }, undefined]],
+    '写入要用条目 id，且不带 revision（不参与乐观锁）')
+  assert.equal(provider.live.乱写, undefined, '非白名单字段不许落到设置服务')
+
+  assert.equal(scope.overridden('scale'), true, '写过的字段出现在用户层里')
+  assert.equal(scope.overridden('backgroundSummary'), false)
+})
+
+test('设置作用域（0.2）：DSH 设置页改的值经 loader/volatile-update 到达订阅者', async () => {
+  const provider = fakeEntryProvider({ scale: 0.4 })
+  const handlers = new Map()
+  const ctx = {
+    settings: provider,
+    fiber: { entry: { options: { id: 'dsh-assistant' } } },
+    on(event, callback) { handlers.set(event, callback) },
+  }
+  const scope = createSettingsScope(ctx, { scale: { get: () => provider.live.scale } }, console)
+  assert.ok(handlers.has('loader/volatile-update'), '宿主必须订阅这条事件，否则设置页改的值到不了宠物')
+
+  const seen = []
+  scope.watch((next) => seen.push(next.scale))
+
+  // 模拟 DSH 自己的设置页写入：Loader 提交引用后就地换值并发事件
+  provider.live.scale = 1.2
+  handlers.get('loader/volatile-update')([['scale']])
+  assert.deepEqual(seen, [1.2], '订阅者要拿到新值（宠物据此热更新）')
+  assert.equal(scope.get().scale, 1.2)
+
+  // 值没变就不该重复打扰订阅者
+  handlers.get('loader/volatile-update')([['scale']])
+  assert.deepEqual(seen, [1.2])
+})
+
+test('回归：作用域落地时不拿 describe() 判"条目在不在"（那时自己的 fiber 还没活动）', () => {
+  // 真服务在插件 apply 期间会把自己的条目过滤掉（entry.fiber.state !== 2），
+  // 早先按"describe() 里没有 → 退回内存"处理，于是唯一一条正确路径永远走不到：
+  // 设置看着能改、其实一条都没落盘。这里守的就是"不许再这么判"。
+  let described = 0
+  const provider = {
+    describe() { described += 1; return [] },
+    update: async () => {},
+  }
+  const scope = createSettingsScope(
+    { settings: provider, fiber: { entry: { options: { id: 'dsh-assistant' } } } },
+    { scale: 0.6 },
+  )
+  assert.equal(scope.source, 'service', '有 describe/update 的服务就是 0.2 的服务，照用')
+  assert.equal(scope.entry, 'dsh-assistant')
+  assert.equal(described, 0, '落地阶段不该去问 describe()')
+  assert.equal(scope.get().scale, 0.6)
+})
+
+test('设置作用域（0.2）：写失败要抛给调用方（端点据此报 400，不静默吞掉）', async () => {
+  const provider = fakeEntryProvider({ scale: 0.4 })
+  provider.update = async () => { throw new Error('No configurable plugin entry "dsh-assistant"') }
+  const scope = createSettingsScope(
+    { settings: provider, fiber: { entry: { options: { id: 'dsh-assistant' } } } },
+    { scale: 0.4 },
+    console,
+  )
+  await assert.rejects(() => scope.update({ scale: 0.9 }), /No configurable plugin entry/)
+})
+
 /* ------------------------------------- 下发给原生端的配置（防冲掉原生设置） */
 
 test('配置下发：只下发用户显式设过的字段', () => {
@@ -227,10 +342,13 @@ test('设置端点：GET/PATCH 正常，未知字段被拒', async () => {
   await handler(fakeRequest(), read)
   assert.equal(read.state.status, 200)
   assert.equal(JSON.parse(read.state.body).helperRunning, false)
+  // 面板要能看出配置存在哪儿：内存兜底时"改了不落盘"必须可见，否则用户只能猜
+  assert.deepEqual(JSON.parse(read.state.body).storage, { source: 'memory' })
 
   const ok = fakeResponse()
   await handler(fakeRequest({ method: 'PATCH', body: { scale: 1.25 } }), ok)
   assert.equal(JSON.parse(ok.state.body).scale, 1.25)
+  assert.equal(JSON.parse(ok.state.body).storage.source, 'memory')
 
   const theme = fakeResponse()
   await handler(fakeRequest({ method: 'PATCH', body: { bubbleTheme: 'dark' } }), theme)

@@ -47,7 +47,8 @@ DSH小助手不是需要单独启动的桌宠应用：它由 DSH 插件拉起，
 设置里的「含子 Agent」打开后，子会话会自己占一格，父项目就不再重复显示这份工作。
 
 完成、出错、**等你确认**各会另起一条通知，独立于状态气泡钉在宠物上方，
-点一下就切到那个会话 —— 状态气泡可能正被别的项目占着，通知不会。
+点一下就把 DSH 窗口带到最前、并切到那个会话（macOS 上靠激活 DeepSeek Harness 本体）——
+状态气泡可能正被别的项目占着，通知不会。
 
 | 完成通知 | 等你确认（这条也能点） |
 | --- | --- |
@@ -67,7 +68,7 @@ profile 的 `dsh.profile.bundles` —— 不用手改 `package.json`。
 
 包里带着编译好的 macOS helper 与素材包（44MB），装完就能跑，不需要 Xcode。
 
-重启 DSH 后，桌面右下角会出现宠物，设置面板里多一张「DSH小助手」卡片。
+重启 DSH 后，桌面右下角会出现宠物，设置里多出一页「DSH小助手」（左侧导航里）。
 
 以后升级：
 
@@ -105,9 +106,18 @@ npm test                # Node 单测（含真实 DSH 设置服务的集成用�
 npm run probe           # 不经 DSH，直接驱动宠物跑一遍状态与动作（肉眼验收）
 ```
 
+`npm test` 里那几条集成用例要拿**真的** `schemastery` / `dsh-settings` 跑（假实现测不出设置页
+认不认我们的 schema）。桌面端把 DSH 装在 `app.asar` 里、`$DSH_HOME` 下没有这些包，所以先解一份：
+
+```bash
+DSH_ASSISTANT_DSH_PACKAGES=$(npm run -s dsh:packages) npm test
+```
+
+解出来的那份放在 `$DSH_HOME/cache/dsh-packages/<DSH 版本>/`，同一个版本只会解一次。
+
 ## 外观与互动
 
-设置面板里的一张「DSH小助手」卡片就是全部开关：
+设置里的「DSH小助手」一页就是全部开关：
 
 | 设置 | 默认 | 说明 |
 | --- | --- | --- |
@@ -122,7 +132,9 @@ npm run probe           # 不经 DSH，直接驱动宠物跑一遍状态与动�
 | `autoInteract` | 开 | 自己找点事做：状态停留够久就随机来一次互动 |
 | `autoInteractSeconds` | 10 | 上面那件事的判定间隔（5 – 300 秒），每隔这么久掷一次 30% 的骰子 |
 
-宠物可以直接拖着走，位置与上面的偏好都记在本机（`$DSH_HOME/dsh-assistant/layout.json`）。
+宠物可以直接拖着走：位置记在本机（`$DSH_HOME/dsh-assistant/layout.json`），上面这些偏好
+交给 DSH 存 —— 0.2 起写在 profile 补丁里（`$DSH_HOME/profiles/<profile>/cordis.patch.yml`
+的 `dsh-assistant` 段），重启也在；0.1 那代写 `settings.yaml`。
 
 **自己找点事做**：任意状态**连续维持**一个间隔（默认 10 秒），就有 30% 概率随机来一次
 投喂点心 / 夸夸它 / 摸摸头；浮层还在播的时候不打扰你。嫌闹就把间隔调大，或者直接关掉。

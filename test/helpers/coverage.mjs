@@ -44,7 +44,10 @@ export function coverageGate(label, available, optOutEnv, detail) {
 /**
  * DSH 自己的包（cordis / dsh-settings …）装在哪。
  *
- * 只认环境：`$DSH_HOME`（缺省 `~/.dsh`）下的 `profiles/node_modules` 与 `node_modules`。
+ * 只认环境：`$DSH_HOME`（缺省 `~/.dsh`）下的 `profiles/node_modules` 与 `node_modules`；
+ * 另外允许 `DSH_ASSISTANT_DSH_PACKAGES` 直接点名一个 `node_modules` 目录 —— 桌面端
+ * （Electron）的 DSH 包在 app.asar 里、$DSH_HOME 下根本没有，用这个变量指一份解出来的即可
+ * （`npm run dsh:packages` 会解一份并打印路径）。
  * 以前这里写死过 `~/Documents/projects/slf/agent-mesh/desktop/.local/dsh-home`
  * —— 那是开发机的目录结构，不该出现在仓库里。
  *
@@ -52,13 +55,15 @@ export function coverageGate(label, available, optOutEnv, detail) {
  * 但 `ls` 看名字还在 —— 那种"看着装了其实用不了"的状态必须当成没装。
  */
 export function dshPackagesDir() {
-  const homes = [process.env.DSH_HOME, join(homedir(), '.dsh')].filter(Boolean)
-  for (const home of homes) {
-    for (const candidate of [join(home, 'profiles', 'node_modules'), join(home, 'node_modules')]) {
-      if (realpathExists(join(candidate, '@deepseek-ai', 'cordis'))
-        && realpathExists(join(candidate, '@deepseek-ai', 'dsh-settings'))) {
-        return candidate
-      }
+  const explicit = process.env.DSH_ASSISTANT_DSH_PACKAGES
+  const candidates = explicit ? [explicit] : []
+  for (const home of [process.env.DSH_HOME, join(homedir(), '.dsh')].filter(Boolean)) {
+    candidates.push(join(home, 'profiles', 'node_modules'), join(home, 'node_modules'))
+  }
+  for (const candidate of candidates) {
+    if (realpathExists(join(candidate, '@deepseek-ai', 'cordis'))
+      && realpathExists(join(candidate, '@deepseek-ai', 'dsh-settings'))) {
+      return candidate
     }
   }
   return undefined

@@ -55,6 +55,14 @@ function jsonResponse(res, status, body) {
   res.end(payload)
 }
 
+/** 配置后端的一句话描述（面板提示与排查都要用；见 GET/PATCH 的 storage 字段）。 */
+function storageOf(settings) {
+  return {
+    source: settings?.source === 'service' ? 'service' : 'memory',
+    entry: settings?.entry,
+  }
+}
+
 async function readJsonBody(req, limit = 8192) {
   const chunks = []
   let bytes = 0
@@ -217,6 +225,9 @@ export function createConfigHandler(settings, petHandle, logger = console) {
         roster: handle?.roster?.() ?? [],
         // 面板的字段名/边界/默认值都从这里拿（别在浏览器侧再抄一遍）
         fields: fieldMetadata(),
+        // 配置存在哪儿：service = 落盘（0.2 写 profile 补丁 / 0.1 写 settings.yaml），
+        // memory = 只在本进程里（重启即丢）。面板据此提示，免得"改了没反应"无从查起。
+        storage: storageOf(settings),
       })
       return
     }
@@ -229,7 +240,7 @@ export function createConfigHandler(settings, petHandle, logger = console) {
         // 写入走的就是宿主自己那份 scope：settings.watch 会让宠物热更新，
         // 不需要端点额外推一次配置（内存兜底也实现了 watch）。
         await settings.update(patch)
-        jsonResponse(res, 200, { ...settings.get(), fields: fieldMetadata() })
+        jsonResponse(res, 200, { ...settings.get(), fields: fieldMetadata(), storage: storageOf(settings) })
       } catch (error) {
         rejects.reject(req, 400, messageOf(error))
         jsonResponse(res, 400, { error: messageOf(error) })

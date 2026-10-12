@@ -57,10 +57,11 @@ function loadClientModule({ withDom = false } = {}) {
 }
 
 /** 假客户端上下文：只实现 slots / inject / effect / get。 */
-function fakeClientContext({ sessions } = {}) {
+function fakeClientContext({ sessions, uiWorkspace } = {}) {
   const slots = []
   const effects = []
   const injected = []
+  const services = { sessions, uiWorkspace }
   const ctx = {
     slots: {
       register(options) { slots.push(options); return () => {} },
@@ -71,7 +72,7 @@ function fakeClientContext({ sessions } = {}) {
       callback({ get: (key) => (key === 'sessions' ? sessions : undefined) })
     },
     effect(callback) { effects.push(callback()) },
-    get: (key) => (key === 'sessions' ? sessions : undefined),
+    get: (key) => services[key],
   }
   // 插件跑起来后会开一个长轮询循环，测试结束必须停掉，否则进程不退出
   const stop = () => { for (const dispose of effects) { try { dispose?.() } catch { /* 忽略 */ } } }
@@ -89,7 +90,7 @@ function fakeSessionList(initial) {
   }
 }
 
-test('客户端：注册设置页与插件卡，槽位参数各自合规', () => {
+test('客户端：注册设置页，槽位参数合规；0.2 里没有的插件卡不再注册', () => {
   const module = loadClientModule()
   assert.equal(module.name, 'dsh-assistant-client')
   assert.deepEqual(module.inject, ['slots'])
@@ -98,16 +99,19 @@ test('客户端：注册设置页与插件卡，槽位参数各自合规', () =>
   module.apply(harness.ctx)
 
   const section = harness.slots.find((options) => options.name === 'settings.section')
-  const card = harness.slots.find((options) => options.name === 'settings.plugin.item')
   assert.ok(section, '要注册设置页（list 槽位）')
   assert.equal(section.id, 'dsh-assistant', 'list 槽位必须有 id')
   assert.equal(typeof section.label, 'function', 'label 用 thunk 形式')
   assert.equal(typeof section.inject, 'function', 'inject 是 props 工厂')
 
-  assert.ok(card, '要注册插件配置卡（keyed 槽位）')
-  assert.equal(card.key, 'dsh-assistant', 'keyed 槽位只认 key，且必须等于设置 namespace')
-  assert.equal(card.id, undefined, 'keyed 槽位的 id/order 是无效字段，不该再写')
-  assert.equal(card.order, undefined)
+  // DSH 0.2 起 `settings.plugin.item` 这个槽位没了（插件页改成 settings.plugins.tab，
+  // 条目卡片由插件导出的 Config 自动生成）。往里注册只会是一条永远不触发的死声明，
+  // 所以这里守的是"别再写回去"。
+  assert.equal(
+    harness.slots.filter((options) => options.name === 'settings.plugin.item').length, 0,
+    'settings.plugin.item 在 0.2 里已不存在，不该再注册',
+  )
+  harness.stop()
 })
 
 test('客户端：切换会话会向宿主上报"我在看这个会话"', async () => {
@@ -170,33 +174,37 @@ test('客户端：没有选中会话 / 端点失败都不该抛', async () => {
   const harness = fakeClientContext({ sessions: { list } })
 
   const originalFetch = globalThis.fetch
-  let calls = 0
-  globalThis.fetch = async () => { calls += 1; throw new Error('宿主没起来') }
+  // 只数"上报我在看哪个会话"的那些请求：命令通道自己也在长轮询 /pending
+  const viewed = []
+  globalThis.fetch = async (url) => {
+    if (String(url).endsWith('/viewed')) viewed.push(url)
+    throw new Error('宿主没起来')
+  }
   try {
     module.apply(harness.ctx)
     list.push({ current: undefined })
     list.push({ current: '' })
     await new Promise((done) => setTimeout(done, 0))
-    assert.equal(calls, 0, '没有会话 id 就不该发请求')
+    assert.equal(viewed.length, 0, '没有会话 id 就不该发请求')
 
     list.push({ current: 'session-c' })
     await new Promise((done) => setTimeout(done, 0))
-    assert.equal(calls, 1, '有 id 就发一次（失败被吞掉，不影响界面）')
+    assert.equal(viewed.length, 1, '有 id 就发一次（失败被吞掉，不影响界面）')
   } finally {
     globalThis.fetch = originalFetch
     harness.stop()
   }
 })
 
-test('客户端：收到"打开会话"命令就切过去（点宠物通知的落地动作）', async () => {
+test('客户端：收到"打开会话"命令就切过去（0.2 走 uiWorkspace.openSession）', async () => {
   const module = loadClientModule()
   const list = fakeSessionList({ current: 'session-now' })
-  const harness = fakeClientContext({ sessions: { list } })
-
   const opened = []
-  const openedService = { list, open: (id) => opened.push(id) }
-  // 命令通道用同一个 sessions 服务，但会调 open()
-  harness.ctx.inject = (deps, callback) => callback({ get: (key) => (key === 'sessions' ? openedService : undefined) })
+  // 0.2 的客户端里 `sessions.open` 已经没有了：切主视图归 workspace 服务
+  const harness = fakeClientContext({
+    sessions: { list },
+    uiWorkspace: { openSession: (id) => opened.push(id) },
+  })
 
   const originalFetch = globalThis.fetch
   let served = 0
@@ -210,7 +218,7 @@ test('客户端：收到"打开会话"命令就切过去（点宠物通知的落
   try {
     module.apply(harness.ctx)
     await new Promise((done) => setTimeout(done, 50))
-    assert.deepEqual(opened, ['session-a'], '要调用 sessions.open(sessionId)')
+    assert.deepEqual(opened, ['session-a'], '要调用 uiWorkspace.openSession(sessionId)')
     await new Promise((done) => setTimeout(done, 30))
     assert.deepEqual(opened, ['session-a'], '重复命令不该重复执行')
   } finally {
@@ -219,13 +227,66 @@ test('客户端：收到"打开会话"命令就切过去（点宠物通知的落
   }
 })
 
-test('客户端：sessions.open 抛错（会话已销毁）不该被当成通信故障', async () => {
+test('客户端：老客户端（0.1，没有 uiWorkspace）退回 sessions.open', async () => {
   const module = loadClientModule()
   const list = fakeSessionList({ current: 'session-now' })
-  const harness = fakeClientContext({ sessions: { list } })
+  const opened = []
+  const harness = fakeClientContext({ sessions: { list, open: (id) => opened.push(id) } })
+
+  const originalFetch = globalThis.fetch
+  let served = 0
+  globalThis.fetch = async (url) => {
+    if (!String(url).endsWith('/pending')) return { ok: true, json: async () => ({}) }
+    served += 1
+    return served === 1
+      ? { ok: true, json: async () => ({ commands: [{ kind: 'open-session', sessionId: 'session-b' }] }) }
+      : { ok: false }
+  }
+  try {
+    module.apply(harness.ctx)
+    await new Promise((done) => setTimeout(done, 50))
+    assert.deepEqual(opened, ['session-b'])
+  } finally {
+    globalThis.fetch = originalFetch
+    harness.stop()
+  }
+})
+
+test('回归：两代接口都没有时不许静默 —— 控制台要留下一条', async () => {
+  const module = loadClientModule()
+  const harness = fakeClientContext({ sessions: { list: fakeSessionList({ current: undefined }) } })
+
+  const errors = []
+  const originalError = console.error
+  const originalFetch = globalThis.fetch
+  let served = 0
+  console.error = (line) => errors.push(String(line))
+  globalThis.fetch = async (url) => {
+    if (!String(url).endsWith('/pending')) return { ok: true, json: async () => ({}) }
+    served += 1
+    return served === 1
+      ? { ok: true, json: async () => ({ commands: [{ kind: 'open-session', sessionId: 'session-a' }] }) }
+      : { ok: false }
+  }
+  try {
+    module.apply(harness.ctx)
+    await new Promise((done) => setTimeout(done, 50))
+    assert.equal(errors.length, 1, '必须说一次"这个客户端打不开会话"，而不是一声不吭')
+    assert.match(errors[0], /uiWorkspace|sessions\.open/)
+  } finally {
+    globalThis.fetch = originalFetch
+    console.error = originalError
+    harness.stop()
+  }
+})
+
+test('客户端：打开会话抛错（会话已销毁）不该被当成通信故障', async () => {
+  const module = loadClientModule()
+  const list = fakeSessionList({ current: 'session-now' })
   const attempted = []
-  harness.ctx.inject = (deps, callback) => callback({
-    get: () => ({ list, open: (id) => { attempted.push(id); throw new Error('session gone') } }),
+  const harness = fakeClientContext({
+    sessions: { list },
+    uiWorkspace: { openSession: (id) => { attempted.push(id); throw new Error('session gone') } },
   })
 
   const originalFetch = globalThis.fetch
@@ -258,13 +319,14 @@ test('客户端：拿不到 sessions 服务时安静跳过（设置页照常注�
   module.apply(harness.ctx)
   assert.ok(harness.slots.some((options) => options.name === 'settings.section'),
     '没有 sessions 也要把设置页注册上')
+  harness.stop()
 })
 
 test('客户端：没有 subscribe（老客户端）时安静跳过，不误报', () => {
   const module = loadClientModule()
   const harness = fakeClientContext({ sessions: { list: { getSnapshot: () => ({ current: 'x' }) } } })
   module.apply(harness.ctx)
-  assert.ok(harness.slots.length >= 2, '设置页照常注册')
+  assert.ok(harness.slots.length >= 1, '设置页照常注册')
   harness.stop()
 })
 

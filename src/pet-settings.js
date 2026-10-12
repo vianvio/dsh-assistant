@@ -7,7 +7,9 @@
  * 是唯一入口，`index.js` 装配一次，同时交给 mountPet 与本地端点。
  *
  * 三条后端，同一个接口（get / update / watch / overridden）：
- *   · DSH 设置服务（持久化到 $DSH_HOME/settings.yaml 的 <namespace> 段）；
+ *   · DSH 0.2 设置服务：namespace 就是 profile 条目 id（`dsh-assistant`），schema 来自插件
+ *     导出的 `Config`，写入走 `settings.update(ns, patch)` → 落到 profile 补丁那份 config；
+ *   · DSH 0.1 设置服务：老签名 `register(ns, schema, { base })`，用户层在 settings.yaml；
  *   · 内存兜底（拿不到服务，或服务拒绝注册时用：重启即丢，但不崩）。
  *
  * **字段契约只有 SETTINGS_FIELDS 一份**：WRITABLE_FIELDS / defaults / publicConfig /
@@ -174,6 +176,24 @@ export function publicConfig(config = {}) {
   return out
 }
 
+/**
+ * DSH 0.2 起，配置里的字段值可能是 **volatile 引用**（`{ get() }`，由 schemastery 的
+ * `.volatile()` 生成）——设置服务把这些字段就地改写，插件读引用就能拿到最新值。
+ * 老运行时（0.1.x）里它们是裸值。两种都要能读。
+ */
+function readValue(value) {
+  return value !== null && typeof value === 'object' && typeof value.get === 'function'
+    ? value.get()
+    : value
+}
+
+/** 把（可能带引用的）原始配置读成归一化后的普通对象。 */
+export function readConfig(config = {}) {
+  const out = {}
+  for (const name of WRITABLE_FIELDS) out[name] = readValue(config?.[name])
+  return out
+}
+
 export function clampScale(value) {
   return normalizeField('scale', value)
 }
@@ -186,15 +206,21 @@ export function clampAutoInteractSeconds(value) {
 /**
  * schemastery 由 DSH profile 提供，插件自己不打包依赖，所以只能在运行时找。
  *
- * 找不到**不再降级**：DSH 设置服务要的只是「一个把原始值解析成配置的函数」
+ * 候选位置可能同时存在**两代** schemastery（开发机上常见：$DSH_HOME/profiles/node_modules
+ * 里那份是更早的 checkout）：3.18.2 没有 `.volatile()`，用它搭出来的 schema 在 0.2 的设置页里
+ * 一个可编辑字段都不算（`isVolatilePath()` 全 false），设置卡会变成只读。所以**优先挑支持
+ * volatile 的那一份**；一个都没有时才退回老的那份（0.1 运行时仍然照常工作）。
+ *
+ * 找不到**不再降级**：DSH 0.1 设置服务要的只是「一个把原始值解析成配置的函数」
  * （`dsh-settings` 的 resolve 就是 `schema(mergeLayers(base, section))`），
  * 我们的归一化函数正好符合这个形状，于是照样注册、照样读写持久化。
- * 以前这里找不到就整条服务分支跳过 —— 用户存过的设置被静默忽略、改设置不落盘，
- * 只留一句 warn（把「schema 有没有」和「存储后端用哪个」两件事绑在了一起）。
  */
 function loadSchema() {
   const bases = [import.meta.url]
   try {
+    // 显式点名的一套 DSH 包（测试/离线核对用；桌面端把包装在 app.asar 里，$DSH_HOME 下没有）
+    const explicit = process.env.DSH_ASSISTANT_DSH_PACKAGES
+    if (explicit) bases.push(pathToFileURL(join(explicit, 'package.json')).href)
     const home = process.env.DSH_HOME || join(homedir(), '.dsh')
     const profile = process.env.DSH_PROFILE || 'desktop'
     bases.push(pathToFileURL(join(home, 'profiles', profile, 'package.json')).href)
@@ -202,16 +228,19 @@ function loadSchema() {
   } catch {
     // 路径拼不出来就只用插件自身
   }
+  let legacy
   for (const base of bases) {
     try {
       const loaded = createRequire(base)('@deepseek-ai/schemastery')
       const schema = loaded?.default ?? loaded
-      if (typeof schema?.object === 'function' && typeof schema?.boolean === 'function') return schema
+      if (typeof schema?.object !== 'function' || typeof schema?.boolean !== 'function') continue
+      if (typeof schema.boolean().volatile === 'function') return schema
+      legacy ??= schema
     } catch {
       // 换下一个位置
     }
   }
-  return undefined
+  return legacy
 }
 
 /** 兜底 schema：可调用（服务要的就是这个）+ toJSON（设置页要序列化）。 */
@@ -240,6 +269,17 @@ fallbackSchema.toJSON = () => ({
 
 const Schema = loadSchema()
 
+/**
+ * 标成"可热改"：DSH 0.2 的设置页只把 volatile 字段当可编辑项（`isVolatilePath()`），
+ * 改完由 Loader 直接换掉运行中那份引用的值，不重启插件。
+ *
+ * schemastery 3.18.2（0.1.x 那一代）没有 `.volatile()`，那里退化成普通字段 —— 老运行时
+ * 的配置本来就要重启才生效，行为不变。
+ */
+function volatile(node) {
+  return typeof node?.volatile === 'function' ? node.volatile() : node
+}
+
 /** 配置 schema：schemastery 在就用它（设置页能渲染出控件），不在就用等价的可调用兜底。 */
 export const PetConfig = Schema
   ? Schema.object(Object.fromEntries(Object.entries(SETTINGS_FIELDS).map(([name, field]) => {
@@ -253,9 +293,20 @@ export const PetConfig = Schema
     } else {
       node = Schema.boolean()
     }
-    return [name, node.default(field.default).description(field.description)]
+    return [name, volatile(node.default(field.default).description(field.description))]
   }))).description('由 DSH 会话状态驱动的桌面宠物')
   : undefined
+
+/**
+ * 插件对 DSH 声明的配置 schema —— 0.2 起**必须由插件入口导出这个名字**：
+ *   · 设置页/`settings.describe()` 从这里取表单（没有它，条目根本不出现在设置里）；
+ *   · `settings.update()` 只接受落在 volatile 字段上的写入；
+ *   · Loader 用它解析 profile 条目里的 `config`，并生成我们读的那份引用。
+ *
+ * 没有 schemastery（老运行时不装、或从非 profile 位置挂载）时是 undefined：
+ * Loader 会把条目里的 config 原样交给我们，插件照常跑，只是没有设置页。
+ */
+export const Config = PetConfig
 
 /** 实际注册用的 schema：优先真 schemastery，缺失时用兜底（两者都可用、都能持久化）。 */
 export function effectiveSchema() {
@@ -267,13 +318,88 @@ function writablePatch(patch = {}) {
   return Object.fromEntries(Object.entries(patch).filter(([key]) => WRITABLE_FIELDS.includes(key)))
 }
 
-/** 找到 DSH 设置服务（provider）。插件上下文的 ctx.settings 与 ctx.get('settings') 等价。 */
+/**
+ * 找到 DSH 设置服务（provider）。插件上下文的 ctx.settings 与 ctx.get('settings') 等价。
+ *
+ * 两代签名不同，这里只回答"有没有"（用哪条路见 createSettingsScope）：
+ *   · 0.2.0+：`describe()` / `update(ns, patch)`，namespace 就是 profile 条目 id；
+ *   · 0.1.x ：`register(ns, schema, { base })` + namespace 级 get/update/watch。
+ */
 function resolveSettingsProvider(ctx) {
   for (const source of [ctx, ctx?.root]) {
     const candidate = source?.settings ?? source?.get?.('settings')
+    if (typeof candidate?.describe === 'function' && typeof candidate?.update === 'function') return candidate
     if (typeof candidate?.register === 'function') return candidate
   }
   return undefined
+}
+
+/**
+ * 我们的配置落在设置服务的哪个 namespace 上。
+ *
+ * 0.2.0 起 namespace **就是 profile 条目的 id**（组合补丁里 `id: dsh-assistant`），
+ * 服务按这个 id 在 profile 补丁里找那一条；取不到 fiber（测试里手搓的 ctx、或插件被
+ * 直接 ctx.plugin() 挂载）时退回契约里的那个名字。
+ */
+function entryIdOf(ctx) {
+  const id = ctx?.fiber?.entry?.options?.id
+  return typeof id === 'string' && id !== '' ? id : SETTINGS_NAMESPACE
+}
+
+/**
+ * "用户显式设过哪些字段"的判定器（两代服务共用一份实现）。
+ *
+ * 缓存很短（250ms）且**只缓存成功的读**：
+ *   · 不缓存 = 每个字段一次 describe()，而它会深拷贝整份 user 层（拖滑块时每个字段都问一遍）；
+ *   · 缓存久了 = "设置明明存了却不生效"（刚 update 过又读到旧的一份）。
+ * 读取失败绝不缓存 —— provider 恢复后要立刻能读到，否则同一个毛病换个姿势再来一遍。
+ * 告警限制成一次：configMessage 每个字段都会来问，不限制会刷屏。
+ */
+function createOverridden(provider, namespace, logger) {
+  let warnedOnce = false
+  let userCache
+  return {
+    read: (field) => {
+      const quiet = warnedOnce ? undefined : {
+        debug: (line) => logger?.debug?.(line),
+        warn: (line) => { warnedOnce = true; logger?.warn?.(line) },
+      }
+      const now = Date.now()
+      if (!userCache || now - userCache.at > USER_FIELDS_TTL_MS) {
+        const read = userFields(provider, namespace, quiet)
+        if (read) userCache = { at: now, fields: read }
+        return read ? read.has(field) : false
+      }
+      return userCache.fields.has(field)
+    },
+    /** 刚写过 / 别处可能改过：下次判定必须重新读（否则"设了不生效"）。 */
+    invalidate: () => { userCache = undefined },
+  }
+}
+
+/** 订阅登记 + 去重：三条后端共用，免得每个分支各写一份 watch。 */
+function createNotifier(logger) {
+  const listeners = new Set()
+  let last
+  return {
+    watch(callback) {
+      listeners.add(callback)
+      return () => listeners.delete(callback)
+    },
+    /** 值没变就不打扰订阅者（volatile 提交与本地写入都会走到这里）。 */
+    publish(next) {
+      const key = JSON.stringify(next)
+      if (key === last) return
+      last = key
+      for (const callback of [...listeners]) {
+        try {
+          callback(next)
+        } catch (error) {
+          logger?.debug?.(`dsh-assistant: 配置订阅者抛错（已忽略）: ${message(error)}`)
+        }
+      }
+    },
+  }
 }
 
 /**
@@ -283,64 +409,106 @@ function resolveSettingsProvider(ctx) {
  * 没被用户设过的字段不下发给原生端，免得把原生菜单里调好的值冲掉。
  *
  * @param {object} ctx 插件上下文
- * @param {object} [compositionConfig] 组合补丁里的配置（base 层）
+ * @param {object} [compositionConfig] 组合配置：0.2 起是 Loader 解析好的条目 config
+ *   （volatile 字段是引用），0.1 起是补丁里的 base 层
  * @param {object} [logger]
- * @param {{ schema?: Function, provider?: object }} [options] 测试注入点：
- *   schema 覆盖注册用的 schema，provider 跳过上下文探测直接给一个服务替身 ——
- *   有了它，用例不必依赖开发机 $HOME 里装没装 DSH。
+ * @param {{ schema?: Function, provider?: object, entryId?: string, config?: object, base?: object }} [options]
+ *   测试注入点：schema 覆盖注册用的 schema，provider 跳过上下文探测直接给一个服务替身，
+ *   config/base 把"活的那份配置"与"base 层"分开传 ——
+ *   有了它们，用例不必依赖开发机 $HOME 里装没装 DSH。
  * @returns {{ source: 'service'|'memory', get: () => object, update: (patch: object) => Promise<object>, watch: (cb: (next: object) => void) => () => void, overridden: (field: string) => boolean }}
  */
 export function createSettingsScope(ctx, compositionConfig = {}, logger = console, options = {}) {
-  const base = publicConfig(compositionConfig)
+  const config = options.config ?? compositionConfig
+  const base = publicConfig(readConfig(options.base ?? compositionConfig))
   const provider = options.provider ?? resolveSettingsProvider(ctx)
   const schema = options.schema ?? effectiveSchema()
+  const entryId = options.entryId ?? entryIdOf(ctx)
 
+  if (provider && typeof provider.register === 'function') {
+    return createRegisteredScope({ provider, schema, base, entryId, logger })
+  }
   if (provider) {
-    let warnedOnce = false
-    /** 用户层的短缓存：拖滑块时配置会连续下发，每个字段都去 describe() 一次太浪费。 */
-    let userCache
-    try {
-      const scope = provider.register(SETTINGS_NAMESPACE, schema, { base, applies: 'live' })
-      logger.debug?.(`[dsh-assistant] 设置存储: DSH 设置服务（持久化到 ${SETTINGS_NAMESPACE} 段）`)
-      return {
-        source: 'service',
-        get: () => publicConfig(scope.get()),
-        update: async (patch) => {
-          await scope.update(writablePatch(patch))
-          userCache = undefined // 刚写过，下次判定必须重新读（否则"设了不生效"）
-          return publicConfig(scope.get())
-        },
-        watch: (callback) => scope.watch((next) => {
-          userCache = undefined // 用户层可能在别处被改了（DSH 自己的设置界面也写这一份）
-          callback(publicConfig(next))
-        }),
-        overridden: (field) => {
-          // 缓存很短（250ms）且**只缓存成功的读**：
-          //   · 不缓存 = 每个字段一次 describe()，而它会深拷贝整份 user 层（拖滑块时每个字段都问一遍）；
-          //   · 缓存久了 = "设置明明存了却不生效"（刚 update 过又读到旧的一份）。
-          // 读取失败绝不缓存 —— provider 恢复后要立刻能读到，否则同一个毛病换个姿势再来一遍。
-          // 告警限制成一次：configMessage 每个字段都会来问，不限制会刷屏。
-          const quiet = warnedOnce ? undefined : {
-            debug: (line) => logger.debug?.(line),
-            warn: (line) => { warnedOnce = true; logger.warn?.(line) },
-          }
-          const now = Date.now()
-          if (!userCache || now - userCache.at > USER_FIELDS_TTL_MS) {
-            const read = userFields(provider, quiet)
-            if (read) userCache = { at: now, fields: read }
-            return read ? read.has(field) : false
-          }
-          return userCache.fields.has(field)
-        },
-      }
-    } catch (error) {
-      logger.warn?.(
-        `dsh-assistant: 注册设置 namespace 失败，本次改为内存配置（重启会丢）: ${message(error)}`,
-      )
-    }
+    return createEntryScope({ ctx, provider, config, entryId, logger })
+  }
+  return createMemoryScope(base)
+}
+
+/**
+ * DSH 0.2 的作用域：namespace 是 profile 条目 id，schema 来自插件导出的 Config。
+ *
+ * 读：直接读那份引用（Loader 就地改写它们，所以这里读到的永远是当前值）。
+ * 写：`settings.update(ns, patch)` → 写进 profile 补丁 → configEditor 立刻
+ *     reconcile 回运行中的树（见 dsh-config-editor 的 edit），返回时引用已经是新值。
+ * 改：Loader 提交完会发 `loader/volatile-update`（谁改的都一样，包括 DSH 自己的设置页），
+ *     宿主据此把新配置推给原生端。
+ */
+function createEntryScope({ ctx, provider, config, entryId, logger }) {
+  const notifier = createNotifier(logger)
+  const overridden = createOverridden(provider, entryId, logger)
+  const snapshot = () => publicConfig(readConfig(config))
+
+  try {
+    // 设置页写进来的值也要能到达宠物：引用被就地改掉，只能靠这条事件重新读一遍。
+    ctx?.on?.('loader/volatile-update', () => {
+      overridden.invalidate()
+      notifier.publish(snapshot())
+    })
+  } catch (error) {
+    logger?.warn?.(`dsh-assistant: 订阅 volatile 配置变更失败（设置页改动可能不会立刻到达宠物）: ${message(error)}`)
   }
 
-  return createMemoryScope(base)
+  // 这里**不能**先用 describe() 探一下"条目在不在"：我们正处在 apply 里，自己的 fiber 还没到
+  // 活动态，真服务会把本条目过滤掉（describe() 里 `entry.fiber.state !== 2` 直接跳过），
+  // 探出来的"没有条目"是假的 —— 那条判断会把唯一一条正确路径打回内存配置，设置永远存不上。
+  // 条目真的不可配置时，写入会带着清楚的错误抛给调用方（端点报 400 + 日志），不会静默。
+  logger?.debug?.(`[dsh-assistant] 设置存储: DSH 设置服务（profile 条目 ${entryId} 的 config）`)
+  return {
+    source: 'service',
+    entry: entryId,
+    get: snapshot,
+    update: async (patch) => {
+      await provider.update(entryId, writablePatch(patch), undefined)
+      overridden.invalidate() // 刚写过，下次判定必须重新读
+      const next = snapshot()
+      notifier.publish(next)
+      return next
+    },
+    watch: notifier.watch,
+    overridden: overridden.read,
+  }
+}
+
+/** DSH 0.1 的作用域：namespace 要自己注册，值由服务托管（settings.yaml 那一段）。 */
+function createRegisteredScope({ provider, schema, base, entryId, logger }) {
+  const notifier = createNotifier(logger)
+  const overridden = createOverridden(provider, entryId, logger)
+  try {
+    const scope = provider.register(entryId, schema, { base, applies: 'live' })
+    logger.debug?.(`[dsh-assistant] 设置存储: DSH 设置服务（持久化到 ${entryId} 段）`)
+    return {
+      source: 'service',
+      entry: entryId,
+      get: () => publicConfig(scope.get()),
+      update: async (patch) => {
+        await scope.update(writablePatch(patch))
+        overridden.invalidate() // 刚写过，下次判定必须重新读（否则"设了不生效"）
+        const next = publicConfig(scope.get())
+        notifier.publish(next)
+        return next
+      },
+      watch: (callback) => scope.watch((next) => {
+        overridden.invalidate() // 用户层可能在别处被改了（DSH 自己的设置界面也写这一份）
+        notifier.publish(publicConfig(next))
+      }),
+      overridden: overridden.read,
+    }
+  } catch (error) {
+    logger.warn?.(
+      `dsh-assistant: 注册设置 namespace 失败，本次改为内存配置（重启会丢）: ${message(error)}`,
+    )
+    return createMemoryScope(base)
+  }
 }
 
 /** 内存兜底：接口与 settings scope 对齐，并自己维护 watch（原生菜单热更新靠它）。 */
@@ -378,11 +546,12 @@ const USER_FIELDS_TTL_MS = 250
  * DSH 设置里该 namespace 的**用户层**有哪些字段：出现在这里 = 用户显式改过。
  *
  * `describe()` 会把每个 namespace 的 base/user 各深拷贝一份，所以调用方要短缓存
- * （见 `overridden`），别每个字段都调一次（拖滑块时配置会连续下发）。
+ * （见 createOverridden），别每个字段都调一次（拖滑块时配置会连续下发）。
  *
+ * @param {string} namespace 条目 id（0.2）或注册用的 namespace（0.1）
  * @returns {Set<string>|undefined} 读不到就返回 undefined —— 调用方**不要缓存它**，下次要重试
  */
-function userFields(provider, logger) {
+function userFields(provider, namespace, logger) {
   if (typeof provider?.describe !== 'function') {
     // 有的 provider 就是不支持 describe：这里不是错误，说一声就够
     logger?.debug?.('dsh-assistant: 设置服务没有 describe()，无法判断"用户显式设过哪些字段"')
@@ -390,7 +559,7 @@ function userFields(provider, logger) {
   }
   try {
     const descriptor = provider.describe({ redactSecrets: true })
-      ?.find?.((entry) => entry?.ns === SETTINGS_NAMESPACE)
+      ?.find?.((entry) => entry?.ns === namespace)
     return new Set(descriptor?.user ? Object.keys(descriptor.user) : [])
   } catch (error) {
     // **不能静默**：读不到用户层 = 所有字段都判成"没设过" = 一条都不下发给原生端，

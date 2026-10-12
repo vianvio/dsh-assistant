@@ -168,6 +168,13 @@ window.__ModuleLoader__.load({
             ? '原生进程运行中：切到别的应用也一直待在桌面上。拖动可移动，单击互动，右键有菜单。'
             : '原生进程未运行。若在 macOS 上首次安装，请在插件目录执行 npm run build:helper 后重启 DSH。'),
 
+        // 配置存在哪儿由端点说了算（0.2 写 profile 补丁 / 0.1 写 settings.yaml / 内存兜底）。
+        // 内存兜底时"改了重启就丢"必须写在脸上，否则用户只会觉得"设置坏了"。
+        value.storage?.source === 'memory'
+          ? React.createElement('li', { style: hintStyle },
+            '注意：当前设置只存在内存里（这个 DSH 的设置服务不可用），改动能立刻生效，重启 DSH 后会回到默认值。')
+          : null,
+
         React.createElement('li', null,
           React.createElement(Field, { label: '启用', hint: '关闭后会立即收起桌面窗口' },
             React.createElement(Toggle, {
@@ -329,14 +336,40 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 解析"把某个会话带到主视图"这件事 —— 两代客户端的接口不一样：
+     *
+     *   · 0.2：`ctx.uiWorkspace.openSession(id)`（workspace 服务 owns 主视图，
+     *     DSH 自己的聊天界面点子 Agent 会话走的也是它）；`sessions.open` 已经没了；
+     *   · 0.1：`ctx.sessions.open(id)`（侧边栏点会话走的就是它）。
+     *
+     * **延迟到命令真的到来时才解析**：apply 的时候客户端服务未必就绪（老代码因此用
+     * `ctx.inject(['sessions'], …)` 等），而等到用户点了通知，一定已经就绪。
+     */
+    function resolveSessionOpener(ctx) {
+      let warned = false
+      return (sessionId) => {
+        const workspace = ctx.get?.('uiWorkspace')
+        if (typeof workspace?.openSession === 'function') return workspace.openSession(sessionId)
+        const sessions = ctx.get?.('sessions')
+        if (typeof sessions?.open === 'function') return sessions.open(sessionId)
+        // 一条命令都执行不了时必须说话：以前这里静默 return，表现就是
+        // "点通知没反应"，而控制台里一个字都没有。
+        if (!warned) {
+          warned = true
+          console.error('[dsh-assistant] 这个 DSH 客户端没有可用的"打开会话"接口（既没有 uiWorkspace.openSession，也没有 sessions.open），点通知无法切会话')
+        }
+      }
+    }
+
+    /**
      * 长轮询宿主的命令并执行 —— 目前只有「打开某个会话」。
      *
      * 为什么是客户端干这件事：宠物（原生）能感知"用户点了通知"，但它打不开 DSH 界面；
-     * 能切会话的只有这里的 `sessions.open(id)`（侧边栏点会话走的也是它）。
+     * 能把会话切到主视图的只有客户端这一侧。
      * 空闲时 20 秒一个请求，点通知到界面切换之间几乎没有延迟。
      */
-    function runCommands(ctx, sessions) {
-      if (!sessions?.open) return
+    function runCommands(ctx, openSession) {
+      if (typeof openSession !== 'function') return
       let stopped = false
       let controller
       const dispose = () => {
@@ -366,7 +399,7 @@ window.__ModuleLoader__.load({
             for (const command of commands) {
               if (command?.kind !== 'open-session' || typeof command.sessionId !== 'string') continue
               try {
-                sessions.open(command.sessionId)
+                openSession(command.sessionId)
                 // 顺手把窗口带到前台：用户点宠物的意图就是"我要看它"
                 window.focus?.()
               } catch (cause) {
@@ -475,27 +508,13 @@ window.__ModuleLoader__.load({
         console.error('[dsh-assistant] 设置页槽位注入失败:', cause)
       }
 
-      // ② **插件配置卡**（settings.plugin.item）：插件列表里按 namespace 展开的一行。
-      //    槽位是"keyed"语义，只认 key（必须等于设置 namespace），id/order 是无效字段。
-      const card = () => ctx.slots.register({
-        name: 'settings.plugin.item',
-        key: 'dsh-assistant',
-        inject: () => ({}),
-      }, PetCard)
-      try {
-        ctx.slots.inject('settings.plugin.item', card)
-      } catch (cause) {
-        console.error('[dsh-assistant] 设置卡槽位注入失败:', cause)
-      }
-
-      // ③ 会话切换上报（消完成通知）
+      // ② 会话切换上报（消完成通知）
       watchActiveSession(ctx)
 
-      // ④ 命令通道：接收"打开某个会话"（点宠物上的完成通知时由宿主派发）
-      const attachCommands = (scope) => runCommands(ctx, scope.get?.('sessions'))
+      // ③ 命令通道：接收"打开某个会话"（点宠物上的完成通知时由宿主派发）。
+      //    不在这里等某个具体的服务：接口两代不同，命令到来时再解析（见 resolveSessionOpener）。
       try {
-        if (typeof ctx.inject === 'function') ctx.inject(['sessions'], attachCommands)
-        else attachCommands(ctx)
+        runCommands(ctx, resolveSessionOpener(ctx))
       } catch (cause) {
         console.warn('[dsh-assistant] 命令通道未接线:', cause)
       }
