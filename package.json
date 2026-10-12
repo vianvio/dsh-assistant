@@ -1,6 +1,6 @@
 {
   "name": "dsh-assistant",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "DSH小助手：原生 Swift 悬浮窗负责展示与交互，宿主插件负责把它接到 DSH 会话状态（含今日工作总结）",
   "keywords": [
     "dsh",
@@ -49,6 +49,7 @@
     "verify": "node scripts/verify.mjs",
     "test": "node --test --test-timeout=30000 \"test/*.test.mjs\"",
     "test:swift": "bash scripts/test-swift.sh",
+    "dsh:packages": "node scripts/dsh-packages.mjs",
     "probe": "node scripts/probe.mjs",
     "report:check": "node scripts/inspect-report.mjs",
     "test:all": "npm test && npm run test:swift && npm run verify",
@@ -58,6 +59,9 @@
   },
   "engines": {
     "node": ">=22"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh": ">=0.1.5-rc.2 <0.3.0-0"
   },
   "dsh": {
     "bundle": {
