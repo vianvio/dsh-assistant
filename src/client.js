@@ -424,12 +424,31 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 会话列表快照 → "用户此刻在看哪个会话"。两代客户端的表达不一样：
+     *
+     *   · 0.2：快照上没有 `current` 这个字段了，主视图那个会话由**保留来源**表达 ——
+     *     切过去时 workspace 服务会 `sessions.retain(id, { source: 'mainView' })`，
+     *     于是 `byId[id].retainedBy.mainView > 0`。DSH 自己的布局代码就是这么找当前会话的。
+     *   · 0.1：快照上的 `current`。
+     *
+     * 认错了的后果是**静默**的：上报函数直接 return，用户手点侧边栏切过去，
+     * 那条完成通知照样挂在宠物上方（2026-10 用户实测）。
+     */
+    function activeSessionId(snapshot) {
+      if (!snapshot) return undefined
+      if (typeof snapshot.current === 'string' && snapshot.current !== '') return snapshot.current
+      const rows = Object.values(snapshot.byId ?? {})
+      const main = rows.find((row) => (row?.retainedBy?.mainView ?? 0) > 0)
+      return typeof main?.id === 'string' && main.id !== '' ? main.id : undefined
+    }
+
+    /**
      * 上报"用户正在看哪个会话"，让宿主清掉它的完成通知。
      *
      * 为什么必须由客户端上报：宿主侧只有 `session/created`（会话**第一次**载入内存
      * 时发一次），而**刚跑完任务的会话本来就在内存里** —— 用户点它不会再有任何事件，
      * 通知就一直挂在宠物上方（用户实测：点了侧边栏对应会话，气泡不消失）。
-     * 会话列表的 `current` 才是"用户此刻在看哪个会话"的权威来源。
+     * 会话列表里"当前是哪个会话"才是权威来源（见 activeSessionId）。
      *
      * 用 `ctx.inject(['sessions'], …)` 而不是把 sessions 写进 inject 列表：
      * 后者会让整个客户端插件**等**这个服务，缺了就连设置页都不出现；
@@ -444,7 +463,7 @@ window.__ModuleLoader__.load({
         let reportedAt = 0
         /** @param {boolean} force 同一个会话也再报一次（回到 DSH 时用） */
         const report = (force = false) => {
-          const id = list.getSnapshot()?.current
+          const id = activeSessionId(list.getSnapshot())
           if (typeof id !== 'string' || id === '' ) return
           const now = Date.now()
           if (!force && id === reported) return

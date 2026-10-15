@@ -114,6 +114,46 @@ test('客户端：注册设置页，槽位参数合规；0.2 里没有的插件�
   harness.stop()
 })
 
+test('客户端（0.2）：当前会话由"主视图保留"表达 —— 手动切过去也要上报', async () => {
+  const module = loadClientModule()
+  // 0.2 的会话列表快照没有 current：谁被 mainView 保留着，谁就是用户正在看的那个
+  const snapshot = (mainId) => ({
+    ids: ['session-a', 'session-b'],
+    byId: {
+      'session-a': { id: 'session-a', retainedBy: mainId === 'session-a' ? { mainView: 1 } : {} },
+      'session-b': { id: 'session-b', retainedBy: mainId === 'session-b' ? { mainView: 1 } : {} },
+    },
+  })
+  const list = fakeSessionList(snapshot('session-a'))
+  const harness = fakeClientContext({ sessions: { list } })
+
+  const posted = []
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (url, options) => {
+    posted.push([url, JSON.parse(options.body)])
+    return { ok: true, json: async () => ({}) }
+  }
+  try {
+    module.apply(harness.ctx)
+    await new Promise((done) => setTimeout(done, 0))
+    assert.deepEqual(posted.map(([, body]) => body.sessionId), ['session-a'], '订阅时先报当前那个')
+
+    // 用户手点侧边栏切到 session-b：保留来源跟着换 → 必须再报一次，
+    // 否则那条完成通知会一直挂在宠物上方（用户实测的毛病）
+    list.push(snapshot('session-b'))
+    await new Promise((done) => setTimeout(done, 0))
+    assert.deepEqual(posted.map(([, body]) => body.sessionId), ['session-a', 'session-b'])
+
+    // 切走的那一瞬间可能"谁都没被保留"：那时不该报，也不该炸
+    list.push({ ids: [], byId: {} })
+    await new Promise((done) => setTimeout(done, 0))
+    assert.deepEqual(posted.map(([, body]) => body.sessionId), ['session-a', 'session-b'])
+  } finally {
+    globalThis.fetch = originalFetch
+    harness.stop()
+  }
+})
+
 test('客户端：切换会话会向宿主上报"我在看这个会话"', async () => {
   const module = loadClientModule()
   const list = fakeSessionList({ current: undefined })
